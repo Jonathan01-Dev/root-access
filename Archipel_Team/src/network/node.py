@@ -4,6 +4,7 @@ import time
 import json
 import struct
 import os
+import re
 from .protocole import build_packet, PACKET_FORMAT
 
 # Configuration conforme au document technique
@@ -22,7 +23,7 @@ TYPE_MANIFEST  = 0x06
 
 
 class ArchipelNode:
-    def __init__(self, node_id, identity=None, tcp_port=None):
+    def __init__(self, node_id, identity=None, tcp_port=None, db_file=None, local_ip=None):
         self.node_id = node_id
         # allow overriding the TCP port per-instance (for tests/multi-nodes)
         self.tcp_port = tcp_port if tcp_port is not None else TCP_PORT
@@ -48,7 +49,8 @@ class ArchipelNode:
         self.dl_manager = DownloadManager(self)
 
         self.running = True
-        self.db_file = "peer_table.json"
+        self.db_file = db_file or "peer_table.json"
+        self.local_ip = local_ip or os.environ.get("ARCHIPEL_LOCAL_IP")
         self.load_peers()  # Charger les pairs existants au démarrage
 
     def _log_event(self, level, text):
@@ -59,6 +61,18 @@ class ArchipelNode:
 
     def _resolve_local_ip(self):
         """Best-effort local IP selection without any internet dependency."""
+        if self.local_ip:
+            return self.local_ip
+        try:
+            # Route-based selection without internet traffic.
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((MCAST_GRP, MCAST_PORT))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
         try:
             candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
             for cand in candidates:
@@ -68,6 +82,12 @@ class ArchipelNode:
         except Exception:
             pass
         return "0.0.0.0"
+
+    @staticmethod
+    def _is_valid_node_id(node_id):
+        if not node_id or len(node_id) > 64:
+            return False
+        return re.match(r"^[A-Za-z0-9_-]+$", node_id) is not None
 
     # --- MODULE 1.2 : PERSISTANCE ---
     def save_peers(self):
@@ -109,7 +129,27 @@ class ArchipelNode:
         if os.path.exists(self.db_file):
             try:
                 with open(self.db_file, "r") as f:
-                    self.peer_table = json.load(f)
+                    raw = json.load(f)
+                cleaned = {}
+                if isinstance(raw, dict):
+                    for pid, info in raw.items():
+                        if not self._is_valid_node_id(pid):
+                            continue
+                        if not isinstance(info, dict):
+                            continue
+                        ip = info.get("ip")
+                        port = info.get("tcp_port")
+                        if not ip or not isinstance(port, int):
+                            continue
+                        cleaned[pid] = {
+                            "ip": ip,
+                            "tcp_port": port,
+                            "last_seen": float(info.get("last_seen", 0) or 0),
+                            "pubkey": info.get("pubkey"),
+                            "trusted": bool(info.get("trusted", False)),
+                            "trusted_at": int(info.get("trusted_at", 0) or 0),
+                        }
+                self.peer_table = cleaned
                 print(f"[*] {len(self.peer_table)} pairs chargés du disque.")
             except:
                 self.peer_table = {}
@@ -190,8 +230,11 @@ class ArchipelNode:
                         except Exception:
                             pass
 
+                    if not self._is_valid_node_id(remote_id):
+                        continue
                     if remote_id != self.node_id:
                         # Mise à jour Peer Table (Module 1.2)
+                        prev = self.peer_table.get(remote_id)
                         entry = {
                             "ip": addr[0],
                             "tcp_port": tcp_port,
@@ -201,8 +244,12 @@ class ArchipelNode:
                             entry['pubkey'] = remote_pub
                         self.peer_table[remote_id] = entry
                         self.save_peers()
-                        print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
-                        self._log_event("info", f"Peer update: {remote_id} @ {addr[0]}:{tcp_port}")
+                        if prev is None:
+                            print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
+                            self._log_event("info", f"New peer: {remote_id} @ {addr[0]}:{tcp_port}")
+                        elif prev.get("ip") != addr[0] or prev.get("tcp_port") != tcp_port:
+                            print(f"\n[~] Pair mis à jour : {remote_id} @ {addr[0]}:{tcp_port}")
+                            self._log_event("info", f"Peer endpoint changed: {remote_id} @ {addr[0]}:{tcp_port}")
 
                         # Module 1.1 : Réponse PEER_LIST en unicast TCP
                         threading.Thread(target=self.send_peer_list, args=(addr[0], tcp_port), daemon=True).start()
@@ -323,8 +370,7 @@ class ArchipelNode:
         """Envoie un message chiffré (type 0x03) au pair identifié."""
         entry = self.peer_table.get(peer_id)
         if not entry:
-            print(f"[!] Pair {peer_id} inconnu")
-            return
+            raise KeyError(f"Pair {peer_id} inconnu")
         target_ip = entry['ip']
         target_port = entry['tcp_port']
         try:
@@ -342,7 +388,8 @@ class ArchipelNode:
                 if len(self.message_log) > 200:
                     self.message_log = self.message_log[-200:]
         except Exception as e:
-            print(f"[!] Erreur envoi message à {peer_id}: {e}")
+            self._log_event("error", f"Message send failed to {peer_id}: {e}")
+            raise RuntimeError(f"Erreur envoi message à {peer_id}: {e}")
 
     def _tcp_server(self):
         """Serveur TCP gérant au moins 10 connexions (Module 1.3)"""

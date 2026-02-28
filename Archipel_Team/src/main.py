@@ -12,12 +12,19 @@ from network.node import ArchipelNode
 def init_node(args):
     os.environ["TCP_PORT"] = str(args.port)
     os.environ["IDENTITY_FILE"] = args.identity_file
+    if args.local_ip:
+        os.environ["ARCHIPEL_LOCAL_IP"] = args.local_ip
+    if args.clear_peer_db and os.path.exists(args.peer_db):
+        os.remove(args.peer_db)
 
-    node = ArchipelNode(args.node_id or f"NODE_{int(time.time())}", tcp_port=args.port)
+    node = ArchipelNode(
+        args.node_id or f"NODE_{int(time.time())}",
+        tcp_port=args.port,
+        db_file=args.peer_db,
+        local_ip=args.local_ip,
+    )
     if args.node_id is None:
         node.node_id = node.verify_key.encode().hex()[:32]
-    node.db_file = args.peer_db
-    node.load_peers()
     node.start()
     return node
 
@@ -164,6 +171,8 @@ def build_parser():
     start.add_argument("--node-id", default=None)
     start.add_argument("--identity-file", default="identity.key")
     start.add_argument("--peer-db", default="peer_table.json")
+    start.add_argument("--clear-peer-db", action="store_true")
+    start.add_argument("--local-ip", default=None, help="Bind/select this LAN IPv4 for multicast")
     start.add_argument("--no-ai", action="store_true")
     start.add_argument("--ai-api-key", default=None)
     start.add_argument("--ui", action="store_true", help="Start web UI")

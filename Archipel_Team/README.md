@@ -81,6 +81,12 @@ cd Archipel_Team/src
 python main.py start --port 7778 --identity-file idB.key --peer-db peer_table_B.json --ui --ui-port 8081 --no-ai
 ```
 
+Conseil pour un lancement propre (evite les pairs fantomes):
+
+```bash
+python main.py start --port 7777 --identity-file idA.key --peer-db peer_table_A.json --clear-peer-db --local-ip <IP_LAN> --ui --ui-port 8080 --no-ai
+```
+
 Acces UI:
 
 - `http://127.0.0.1:8080` (noeud A)
