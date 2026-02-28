@@ -18,13 +18,10 @@ def init_node(args):
         os.remove(args.peer_db)
 
     node = ArchipelNode(
-        args.node_id or f"NODE_{int(time.time())}",
         tcp_port=args.port,
         db_file=args.peer_db,
         local_ip=args.local_ip,
     )
-    if args.node_id is None:
-        node.node_id = node.node_uid
     node.start()
     return node
 

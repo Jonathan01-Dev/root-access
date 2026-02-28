@@ -125,7 +125,18 @@ class DownloadManager:
             # choose a chunk to request
             idx = sess.next_chunk()
             if idx is None:
-                break
+                # Tous les chunks ont été demandés
+                # Attendre la réception de tous les chunks
+                max_wait = 300  # 5 minutes max
+                start = time.time()
+                while time.time() - start < max_wait:
+                    done, total = sess.progress()
+                    if done == total:
+                        print(f"[DL] All chunks received for {sess.file_id}")
+                        return
+                    time.sleep(0.5)
+                print(f"[DL] Timeout waiting for chunks in {sess.file_id}")
+                return
             # select a peer that is not saturated
             with self.lock:
                 candidate = None
@@ -147,7 +158,6 @@ class DownloadManager:
                 print(f"[!] peer {candidate} not in peer_table")
             # little delay to avoid busy loop
             time.sleep(0.01)
-        # when loop exits, either all chunks requested or no peers
 
     def handle_chunk_data(self, resp, peer_id):
         """Called when a CHUNK_DATA packet is received."""

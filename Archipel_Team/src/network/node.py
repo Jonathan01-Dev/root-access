@@ -24,21 +24,21 @@ TYPE_MANIFEST  = 0x06
 
 
 class ArchipelNode:
-    def __init__(self, node_id, identity=None, tcp_port=None, db_file=None, local_ip=None):
-        self.node_id = node_id
+    def __init__(self, identity=None, tcp_port=None, db_file=None, local_ip=None):
         # allow overriding the TCP port per-instance (for tests/multi-nodes)
         self.tcp_port = tcp_port if tcp_port is not None else TCP_PORT
         # identite : tuple (signing_priv, verify_pub)
         if identity is None:
-            # essayer de charger clÃ©s depuis disque
+            # essayer de charger clés depuis disque
             self.signing_key, self.verify_key = self.load_identity()
         else:
             self.signing_key, self.verify_key = identity
 
-        # dÃ©rivÃ©s Curve25519 pour chiffrement
+        # dérivalés Curve25519 pour chiffrement
         self.curve_priv = self.signing_key.to_curve25519_private_key()
         self.curve_pub = self.verify_key.to_curve25519_public_key()
         self.node_uid = self.verify_key.encode().hex()
+        self.node_id = self.node_uid  # node_id = clé publique en hex
 
         self.peer_table = {}  # Module 1.2: Table de pairs
         # stockage des manifests reÃ§us (file_id -> manifest dict)
@@ -213,15 +213,17 @@ class ArchipelNode:
         """Emet un signal HELLO toutes les 30 secondes"""
         node_id_bytes = self._packet_node_id_bytes()
         send_ips = [self.local_ips[0]] if self.local_ips else ["0.0.0.0"]
+        
+        # Créer la socket UNE FOIS au lieu de la recréer à chaque fois
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        except Exception:
+            pass
 
         while self.running:
             for local_ip in send_ips:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
-                try:
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-                except Exception:
-                    pass
                 try:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
                 except Exception:
@@ -233,14 +235,12 @@ class ArchipelNode:
                         "tcp_port": self.tcp_port,
                         "timestamp": int(time.time()),
                         "pubkey": binascii.hexlify(self.verify_key.encode()).decode(),
-                                            }).encode()
-                    packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
+                    }).encode()
+                    packet = build_packet(0x01, node_id_bytes, payload, self.signing_key.encode())
                     sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
                     print(f"[DBG] HELLO envoyÃ© depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
                 except Exception as e:
                     print(f"[!] Erreur Announcer({local_ip}): {e}")
-                finally:
-                    sock.close()
             time.sleep(30)
 
     def _udp_listener(self):
@@ -332,7 +332,7 @@ class ArchipelNode:
                 node_id_bytes = self._packet_node_id_bytes()
                 # Type PEER_LIST
                 payload = json.dumps(self.peer_table).encode()
-                packet = build_packet(TYPE_PEER_LIST, node_id_bytes, payload, b"test_secret_key")
+                packet = build_packet(TYPE_PEER_LIST, node_id_bytes, payload, self.signing_key.encode())
                 sock.sendall(packet)
         except Exception:
             pass  # Le pair n'est peut-Ãªtre pas encore prÃªt en TCP
@@ -344,7 +344,7 @@ class ArchipelNode:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps(manifest).encode()
-                packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, b"test_secret_key")
+                packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, self.signing_key.encode())
                 sock.sendall(packet)
         except Exception as e:
             print(f"[!] Erreur send_manifest: {e}")
@@ -355,7 +355,7 @@ class ArchipelNode:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": self.tcp_port}).encode()
-                packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, b"test_secret_key")
+                packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, self.signing_key.encode())
                 sock.sendall(packet)
         except Exception as e:
             print(f"[!] Erreur request_chunk: {e}")
@@ -371,7 +371,7 @@ class ArchipelNode:
         manifest = mf.create_manifest(filepath)
         manifest["filepath"] = filepath
         manifest["sender_id"] = self.node_uid
-        manifest["allowed_peers"] = [peer_id]
+        # Broadcast le manifest Ã  tous les pairs (pas de restriction allowed_peers)
         self.manifests[manifest["file_id"]] = manifest
         self.send_manifest(entry["ip"], entry["tcp_port"], manifest)
         self._log_event("info", f"Manifest sent to {peer_id}: {manifest['file_id']}")
@@ -444,7 +444,7 @@ class ArchipelNode:
             ciphertext = self.encrypt_for_peer(peer_id, message.encode())
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self._packet_node_id_bytes()
-                packet = build_packet(0x03, node_id_bytes, ciphertext, b"test_secret_key")
+                packet = build_packet(0x03, node_id_bytes, ciphertext, self.signing_key.encode())
                 sock.sendall(packet)
                 self.message_log.append({
                     "ts": int(time.time()),
@@ -561,10 +561,7 @@ class ArchipelNode:
                             m = self.manifests.get(fid)
                             print(f"[DBG] manifest pour {fid}: {m is not None}")
                             if m:
-                                allowed = m.get("allowed_peers")
-                                if isinstance(allowed, list) and remote_id not in allowed:
-                                    print(f"[SEC] CHUNK_REQ refuse pour pair non autorise: {remote_id}")
-                                    return
+                                # Pas de vérification allowed_peers - tout pair peut télécharger
                                 filepath = m.get('filepath')
                                 print(f"[DBG] filepath: {filepath}, exists: {os.path.exists(filepath) if filepath else False}")
                                 if filepath and os.path.exists(filepath):
@@ -573,7 +570,7 @@ class ArchipelNode:
                                         data_chunk = f.read(m['chunks'][idx]['size'])
                                         resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
                                         node_id_bytes = self._packet_node_id_bytes()
-                                        packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), b"test_secret_key")
+                                        packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), self.signing_key.encode())
                                         # Send back to the requester on a NEW connection
                                         requester_ip = addr[0]
                                         try:
@@ -627,12 +624,8 @@ class ArchipelNode:
 
 
 if __name__ == "__main__":
-    # Test S1: Utiliser un ID basÃ© sur le temps pour lancer plusieurs instances sur le mÃªme PC
-    import random
-
-    TEST_ID = f"NODE_{random.randint(1000, 9999)}"
-
-    node = ArchipelNode(TEST_ID)
+    # Test S1: Instanciation simple pour exécution locale
+    node = ArchipelNode(tcp_port=7777)
     node.start()
 
     # thread affichant pÃ©riodiquement la table de pairs
