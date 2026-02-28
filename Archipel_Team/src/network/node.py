@@ -4,7 +4,7 @@ import time
 import json
 import struct
 import os
-from protocole import build_packet
+from protocole import build_packet, PACKET_FORMAT
 
 # Configuration conforme au document technique
 MCAST_GRP = '239.255.42.99'
@@ -43,7 +43,23 @@ class ArchipelNode:
     def _udp_announcer(self):
         """Emet un signal HELLO toutes les 30 secondes"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+        # Activer le loopback pour voir ses propres annonces en local
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        except Exception:
+            pass
+
+        # Sélectionner automatiquement l'interface locale pour le multicast
+        try:
+            # Détermine l'IP locale en créant un socket UDP vers l'extérieur
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
+        except Exception:
+            local_ip = '0.0.0.0'
         node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
 
         while self.running:
@@ -55,6 +71,7 @@ class ArchipelNode:
                 }).encode()
                 packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
                 sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
+                print(f"[DBG] HELLO envoyé depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
             except Exception as e:
                 print(f"[!] Erreur Announcer: {e}")
             time.sleep(30)
@@ -65,26 +82,53 @@ class ArchipelNode:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', MCAST_PORT))
 
-        mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        # Joindre le groupe multicast sur l'interface locale si possible
+        try:
+            # Détecte IP locale pour l'interface multicast
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(local_ip))
+        except Exception:
+            mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception as e:
+            print(f"[!] Erreur JOIN_MEMBERSHIP: {e}")
 
         while self.running:
             try:
                 data, addr = sock.recvfrom(2048)
-                remote_id = data[5:37].decode(errors='ignore').strip('\0')
+                # Parser header/payload en utilisant la spécification du protocole
+                try:
+                    header_size = struct.calcsize(PACKET_FORMAT)
+                    sig_len = 32
+                    remote_id = data[5:37].decode(errors='ignore').strip('\0')
+                    payload_raw = data[header_size:len(data)-sig_len]
+                    tcp_port = TCP_PORT
+                    if payload_raw:
+                        try:
+                            info = json.loads(payload_raw.decode(errors='ignore'))
+                            tcp_port = info.get('tcp_port', TCP_PORT)
+                        except Exception:
+                            pass
 
-                if remote_id != self.node_id:
-                    # Mise à jour Peer Table (Module 1.2)
-                    self.peer_table[remote_id] = {
-                        "ip": addr[0],
-                        "tcp_port": TCP_PORT,
-                        "last_seen": time.time()
-                    }
-                    self.save_peers()
-                    print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}")
+                    if remote_id != self.node_id:
+                        # Mise à jour Peer Table (Module 1.2)
+                        self.peer_table[remote_id] = {
+                            "ip": addr[0],
+                            "tcp_port": tcp_port,
+                            "last_seen": time.time()
+                        }
+                        self.save_peers()
+                        print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
 
-                    # Module 1.1 : Réponse PEER_LIST en unicast TCP
-                    threading.Thread(target=self.send_peer_list, args=(addr[0], TCP_PORT), daemon=True).start()
+                        # Module 1.1 : Réponse PEER_LIST en unicast TCP
+                        threading.Thread(target=self.send_peer_list, args=(addr[0], tcp_port), daemon=True).start()
+                except Exception as e:
+                    print(f"[!] Erreur parsing UDP packet: {e}")
             except:
                 pass
 
