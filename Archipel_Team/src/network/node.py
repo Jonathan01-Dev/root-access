@@ -12,6 +12,14 @@ MCAST_PORT = 6000
 # défaut, mais peut être surchargé via variable d'environnement pour tests
 TCP_PORT = int(os.environ.get('TCP_PORT', '7777'))
 
+# types de paquet
+TYPE_HELLO     = 0x01
+TYPE_PEER_LIST = 0x02
+TYPE_MSG       = 0x03
+TYPE_CHUNK_REQ = 0x04
+TYPE_CHUNK_DATA= 0x05
+TYPE_MANIFEST  = 0x06
+
 
 class ArchipelNode:
     def __init__(self, node_id, identity=None):
@@ -28,6 +36,8 @@ class ArchipelNode:
         self.curve_pub = self.verify_key.to_curve25519_public_key()
 
         self.peer_table = {}  # Module 1.2: Table de pairs
+        # stockage des manifests reçus (file_id -> manifest dict)
+        self.manifests = {}
         self.running = True
         self.db_file = "peer_table.json"
         self.load_peers()  # Charger les pairs existants au démarrage
@@ -187,12 +197,35 @@ class ArchipelNode:
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
-                # Type 0x02 = PEER_LIST
+                # Type PEER_LIST
                 payload = json.dumps(self.peer_table).encode()
-                packet = build_packet(0x02, node_id_bytes, payload, b"test_secret_key")
+                packet = build_packet(TYPE_PEER_LIST, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
         except Exception:
             pass  # Le pair n'est peut-être pas encore prêt en TCP
+
+    # --- MODULE 3.1/3.3 : MANIFEST & CHUNK TRANSFERT ---
+    def send_manifest(self, target_ip, target_port, manifest):
+        """Envoie le manifest chiffré à un pair donné"""
+        try:
+            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                payload = json.dumps(manifest).encode()
+                packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, b"test_secret_key")
+                sock.sendall(packet)
+        except Exception as e:
+            print(f"[!] Erreur send_manifest: {e}")
+
+    def request_chunk(self, target_ip, target_port, file_id, chunk_idx):
+        """Demande un chunk via TCP"""
+        try:
+            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx}).encode()
+                packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, b"test_secret_key")
+                sock.sendall(packet)
+        except Exception as e:
+            print(f"[!] Erreur request_chunk: {e}")
 
     # --- MODULE 2.1 & 2.4 : CHIFFREMENT E2E ---
     def encrypt_for_peer(self, peer_id, plaintext: bytes) -> bytes:
@@ -260,25 +293,68 @@ class ArchipelNode:
                 data = sock.recv(4096)
                 if data and data.startswith(b"ARCH"):
                     msg_type = data[4]
-                    if msg_type == 0x02:  # Réception PEER_LIST
+                    if msg_type == TYPE_PEER_LIST:
                         print(f"[TCP] Peer List reçue de {addr[0]}")
-                        # Ici on pourrait fusionner les tables
-                    elif msg_type == 0x03:  # Message chiffré
+                        # fusion simplifiée des tables
                         try:
-                            # recuperer l'expéditeur à partir de l'adresse IP/port (simple)
+                            peers = json.loads(data[struct.calcsize(PACKET_FORMAT):-32].decode())
+                            self.peer_table.update(peers)
+                        except Exception:
+                            pass
+                    elif msg_type == TYPE_MSG:
+                        try:
                             remote_id = None
                             for pid, info in self.peer_table.items():
                                 if info.get('ip') == addr[0]:
                                     remote_id = pid
                                     break
-                            if not remote_id:
-                                print(f"[TCP] Message reçu de pair inconnu {addr}")
-                            else:
+                            if remote_id:
                                 payload = data[struct.calcsize(PACKET_FORMAT):-32]
                                 plaintext = self.decrypt_from_peer(remote_id, payload)
                                 print(f"[MSG] {remote_id} -> {plaintext.decode(errors='ignore')}")
                         except Exception as e:
                             print(f"[!] Erreur décryptage message: {e}")
+                    elif msg_type == TYPE_MANIFEST:
+                        try:
+                            remote_id = None
+                            for pid, info in self.peer_table.items():
+                                if info.get('ip') == addr[0]:
+                                    remote_id = pid
+                                    break
+                            if remote_id:
+                                payload = data[struct.calcsize(PACKET_FORMAT):-32]
+                                manifest = json.loads(payload.decode())
+                                print(f"[MANIFEST] reçu de {remote_id} id={manifest.get('file_id')}")
+                                self.manifests[manifest['file_id']] = manifest
+                        except Exception as e:
+                            print(f"[!] Erreur manifest: {e}")
+                    elif msg_type == TYPE_CHUNK_REQ:
+                        try:
+                            payload = data[struct.calcsize(PACKET_FORMAT):-32]
+                            req = json.loads(payload.decode())
+                            fid = req['file_id']; idx = req['chunk_idx']
+                            print(f"[CHUNK_REQ] {addr} file={fid} idx={idx}")
+                            # rechercher manifest local
+                            m = self.manifests.get(fid)
+                            if m:
+                                filepath = m.get('filepath')
+                                if filepath and os.path.exists(filepath):
+                                    with open(filepath,'rb') as f:
+                                        f.seek(idx * m['chunk_size'])
+                                        data_chunk = f.read(m['chunks'][idx]['size'])
+                                        resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
+                                        node_id_bytes = self.node_id.encode().ljust(32,b'\0')[:32]
+                                        packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), b"test_secret_key")
+                                        sock.sendall(packet)
+                        except Exception as e:
+                            print(f"[!] Erreur CHUNK_REQ: {e}")
+                    elif msg_type == TYPE_CHUNK_DATA:
+                        try:
+                            payload = data[struct.calcsize(PACKET_FORMAT):-32]
+                            resp = json.loads(payload.decode())
+                            print(f"[CHUNK_DATA] reçu idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
+                        except Exception as e:
+                            print(f"[!] Erreur CHUNK_DATA: {e}")
             except Exception as e:
                 print(f"[!] Erreur TCP client: {e}")
 
@@ -347,8 +423,23 @@ if __name__ == "__main__":
                     print(pid, info)
             elif parts[0] == 'msg' and len(parts) >= 3:
                 node.send_message(parts[1], parts[2])
+            elif parts[0] == 'manifest' and len(parts) == 2:
+                # envoie le manifest d'un fichier au premier peer (demo)
+                import transfer.manifest as mf
+                manifest = mf.create_manifest(parts[1])
+                manifest['filepath'] = parts[1]
+                # broadcast to all known peers
+                for pid, info in node.peer_table.items():
+                    node.send_manifest(info['ip'], info['tcp_port'], manifest)
+                print("Manifest envoyé")
+            elif parts[0] == 'chunk' and len(parts) == 4:
+                _, dest, fid, idx = parts
+                for pid, info in node.peer_table.items():
+                    if pid == dest:
+                        node.request_chunk(info['ip'], info['tcp_port'], fid, int(idx))
+                        break
             else:
-                print("Usage: peers | msg <node_id> <texte> | quit")
+                print("Usage: peers | msg <node_id> <texte> | manifest <file> | chunk <node_id> <file_id> <idx> | quit")
     except KeyboardInterrupt:
         pass
     finally:
