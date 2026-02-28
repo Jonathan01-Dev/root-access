@@ -4,45 +4,37 @@
 
 ```powershell
 cd Archipel_Team\src
-python main.py start --port 7777 --identity-file idA.key --peer-db peer_table_A.json --no-ai
+python main.py start --port 7777 --identity-file idA.key --peer-db peer_table_A.json --ui --ui-port 8080 --no-ai
 ```
 
 ## 2) Start node B
 
 ```powershell
 cd Archipel_Team\src
-python main.py start --port 7778 --identity-file idB.key --peer-db peer_table_B.json --no-ai
+python main.py start --port 7778 --identity-file idB.key --peer-db peer_table_B.json --ui --ui-port 8081 --no-ai
 ```
 
-## 3) Verify discovery
+## 3) Open dashboards
 
-On both nodes:
+- Node A: `http://127.0.0.1:8080`
+- Node B: `http://127.0.0.1:8081`
 
-```text
-peers
-```
+Use the `Peers` panel to verify discovery.
 
 ## 4) Send encrypted message
 
-From node A:
-
-```text
-msg <node_b_id> Hello secure local mesh
-```
+From Node A dashboard:
+- Fill `Peer ID`
+- Write message
+- Click `Send`
 
 ## 5) Transfer file
 
-From node A:
+From Node A dashboard:
+- In `File Transfer`, set `Target Peer ID` + file path
+- Click `Send Manifest`
 
-```text
-send <node_b_id> C:\path\to\file.bin
-```
-
-On node B:
-
-```text
-receive
-download <file_id>
-status
-```
-
+From Node B dashboard:
+- Copy `file_id` from `Files/Downloads`
+- Click `Download`
+- Follow progress in `Files/Downloads` and `Status`

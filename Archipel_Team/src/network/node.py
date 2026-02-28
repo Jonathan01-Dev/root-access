@@ -40,6 +40,8 @@ class ArchipelNode:
         self.peer_table = {}  # Module 1.2: Table de pairs
         # stockage des manifests reçus (file_id -> manifest dict)
         self.manifests = {}
+        self.message_log = []
+        self.event_log = []
 
         # download manager (Sprint 4)
         from transfer.manager import DownloadManager
@@ -48,6 +50,12 @@ class ArchipelNode:
         self.running = True
         self.db_file = "peer_table.json"
         self.load_peers()  # Charger les pairs existants au démarrage
+
+    def _log_event(self, level, text):
+        item = {"ts": int(time.time()), "level": level, "text": text}
+        self.event_log.append(item)
+        if len(self.event_log) > 200:
+            self.event_log = self.event_log[-200:]
 
     def _resolve_local_ip(self):
         """Best-effort local IP selection without any internet dependency."""
@@ -194,6 +202,7 @@ class ArchipelNode:
                         self.peer_table[remote_id] = entry
                         self.save_peers()
                         print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
+                        self._log_event("info", f"Peer update: {remote_id} @ {addr[0]}:{tcp_port}")
 
                         # Module 1.1 : Réponse PEER_LIST en unicast TCP
                         threading.Thread(target=self.send_peer_list, args=(addr[0], tcp_port), daemon=True).start()
@@ -251,6 +260,7 @@ class ArchipelNode:
         manifest["sender_id"] = self.node_id
         self.manifests[manifest["file_id"]] = manifest
         self.send_manifest(entry["ip"], entry["tcp_port"], manifest)
+        self._log_event("info", f"Manifest sent to {peer_id}: {manifest['file_id']}")
         return manifest["file_id"]
 
     def available_files(self):
@@ -264,6 +274,7 @@ class ArchipelNode:
         self.peer_table[peer_id]["trusted"] = True
         self.peer_table[peer_id]["trusted_at"] = int(time.time())
         self.save_peers()
+        self._log_event("security", f"Peer trusted: {peer_id}")
 
     def node_status(self):
         """Etat synthétique pour la CLI."""
@@ -273,6 +284,8 @@ class ArchipelNode:
             "peers": len(self.peer_table),
             "known_manifests": len(self.dl_manager.sessions),
             "downloads": {},
+            "messages": self.message_log[-50:],
+            "events": self.event_log[-100:],
         }
         for fid, sess in self.dl_manager.sessions.items():
             done, total = sess.progress()
@@ -320,6 +333,14 @@ class ArchipelNode:
                 node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
                 packet = build_packet(0x03, node_id_bytes, ciphertext, b"test_secret_key")
                 sock.sendall(packet)
+                self.message_log.append({
+                    "ts": int(time.time()),
+                    "direction": "out",
+                    "peer": peer_id,
+                    "text": message,
+                })
+                if len(self.message_log) > 200:
+                    self.message_log = self.message_log[-200:]
         except Exception as e:
             print(f"[!] Erreur envoi message à {peer_id}: {e}")
 
@@ -391,7 +412,16 @@ class ArchipelNode:
                             if remote_id:
                                 payload = data[struct.calcsize(PACKET_FORMAT):-32]
                                 plaintext = self.decrypt_from_peer(remote_id, payload)
-                                print(f"[MSG] {remote_id} -> {plaintext.decode(errors='ignore')}")
+                                text = plaintext.decode(errors='ignore')
+                                print(f"[MSG] {remote_id} -> {text}")
+                                self.message_log.append({
+                                    "ts": int(time.time()),
+                                    "direction": "in",
+                                    "peer": remote_id,
+                                    "text": text,
+                                })
+                                if len(self.message_log) > 200:
+                                    self.message_log = self.message_log[-200:]
                         except Exception as e:
                             print(f"[!] Erreur décryptage message: {e}")
                     elif msg_type == TYPE_MANIFEST:
@@ -403,6 +433,7 @@ class ArchipelNode:
                                 self.manifests[manifest['file_id']] = manifest
                                 # inform download manager
                                 self.dl_manager.register_manifest(manifest, remote_id)
+                                self._log_event("transfer", f"Manifest received from {remote_id}: {manifest.get('file_id')}")
                         except Exception as e:
                             print(f"[!] Erreur manifest: {e}")
                     elif msg_type == TYPE_CHUNK_REQ:

@@ -57,8 +57,8 @@ Prerequis:
 Installation:
 
 ```bash
-cd Archipel_Team/src
-pip install pynacl
+cd Archipel_Team
+pip install -r requirements.txt
 ```
 
 Optionnel (IA):
@@ -71,15 +71,20 @@ Demarrer un noeud:
 
 ```bash
 cd Archipel_Team/src
-python main.py start --port 7777 --identity-file idA.key --peer-db peer_table_A.json --no-ai
+python main.py start --port 7777 --identity-file idA.key --peer-db peer_table_A.json --ui --ui-port 8080 --no-ai
 ```
 
 Demarrer un second noeud:
 
 ```bash
 cd Archipel_Team/src
-python main.py start --port 7778 --identity-file idB.key --peer-db peer_table_B.json --no-ai
+python main.py start --port 7778 --identity-file idB.key --peer-db peer_table_B.json --ui --ui-port 8081 --no-ai
 ```
+
+Acces UI:
+
+- `http://127.0.0.1:8080` (noeud A)
+- `http://127.0.0.1:8081` (noeud B)
 
 ## Commandes CLI (Sprint 4)
 
@@ -118,7 +123,7 @@ Une fois `start` lance:
 - Web of Trust simplifie (pas de graphe de signatures complet).
 - Gestion de reprise et priorisation chunks encore basique.
 - HMAC partage: secret statique dans ce prototype (a durcir pour prod).
-- Interface actuelle en CLI interactive, pas de daemon de controle externe.
+- UI web locale simple (Flask), pas encore d'authentification d'interface.
 
 ## Contributions equipe
 

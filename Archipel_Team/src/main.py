@@ -2,43 +2,27 @@ import argparse
 import os
 import shlex
 import sys
+import threading
 import time
 
 from messaging.gemini import GeminiClient
 from network.node import ArchipelNode
 
 
-def _print_peers(node):
-    if not node.peer_table:
-        print("No peers discovered yet.")
-        return
-    for pid, info in node.peer_table.items():
-        trust = "trusted" if info.get("trusted") else "untrusted"
-        print(f"{pid} -> {info.get('ip')}:{info.get('tcp_port')} ({trust})")
+def init_node(args):
+    os.environ["TCP_PORT"] = str(args.port)
+    os.environ["IDENTITY_FILE"] = args.identity_file
+
+    node = ArchipelNode(args.node_id or f"NODE_{int(time.time())}", tcp_port=args.port)
+    if args.node_id is None:
+        node.node_id = node.verify_key.encode().hex()[:32]
+    node.db_file = args.peer_db
+    node.load_peers()
+    node.start()
+    return node
 
 
-def _print_receive(node):
-    if not node.dl_manager.sessions:
-        print("No announced files yet.")
-        return
-    for fid, sess in node.dl_manager.sessions.items():
-        done, total = sess.progress()
-        print(f"{fid} | file={sess.save_path} | progress={done}/{total}")
-
-
-def _print_status(node):
-    st = node.node_status()
-    print(f"node_id={st['node_id']}")
-    print(f"tcp_port={st['tcp_port']}")
-    print(f"peers={st['peers']}")
-    print(f"known_manifests={st['known_manifests']}")
-    if st["downloads"]:
-        print("downloads:")
-        for fid, info in st["downloads"].items():
-            print(f"  {fid}: {info['done']}/{info['total']} -> {info['file']}")
-
-
-def _print_help():
+def print_help():
     print("Commands:")
     print("  peers")
     print("  msg <node_id> <text>")
@@ -52,27 +36,9 @@ def _print_help():
     print("  quit")
 
 
-def _start(args):
-    os.environ["TCP_PORT"] = str(args.port)
-    os.environ["IDENTITY_FILE"] = args.identity_file
-
-    node = ArchipelNode(args.node_id or f"NODE_{int(time.time())}", tcp_port=args.port)
-    if args.node_id is None:
-        # Stable default node id based on the local public key.
-        node.node_id = node.verify_key.encode().hex()[:32]
-    node.db_file = args.peer_db
-    node.load_peers()
-    node.start()
-
-    gemini = GeminiClient(enabled=not args.no_ai, api_key=args.ai_api_key)
+def run_cli(node, gemini):
     context = []
-
-    print(f"Archipel node started: {node.node_id}")
-    if args.no_ai:
-        print("AI mode: disabled (--no-ai)")
-    else:
-        print("AI mode: enabled if GEMINI_API_KEY is configured")
-    _print_help()
+    print_help()
 
     while True:
         try:
@@ -82,7 +48,7 @@ def _start(args):
         if not raw:
             continue
         if raw in ("help", "?"):
-            _print_help()
+            print_help()
             continue
         if raw in ("quit", "exit"):
             break
@@ -91,7 +57,11 @@ def _start(args):
         cmd = parts[0]
         try:
             if cmd == "peers":
-                _print_peers(node)
+                if not node.peer_table:
+                    print("No peers discovered yet.")
+                for pid, info in node.peer_table.items():
+                    trust = "trusted" if info.get("trusted") else "untrusted"
+                    print(f"{pid} -> {info.get('ip')}:{info.get('tcp_port')} ({trust})")
             elif cmd == "msg" and len(parts) >= 3:
                 target = parts[1]
                 text = " ".join(parts[2:])
@@ -122,14 +92,24 @@ def _start(args):
                 file_id = node.send_file(parts[1], parts[2])
                 print(f"Manifest sent. file_id={file_id}")
             elif cmd == "receive":
-                _print_receive(node)
+                if not node.dl_manager.sessions:
+                    print("No announced files yet.")
+                for fid, sess in node.dl_manager.sessions.items():
+                    done, total = sess.progress()
+                    print(f"{fid} | file={sess.save_path} | progress={done}/{total}")
             elif cmd == "download" and len(parts) >= 2:
                 fid = parts[1]
                 out = parts[2] if len(parts) >= 3 else None
                 node.dl_manager.start_download(fid, out)
                 print(f"Download started for {fid}")
             elif cmd == "status":
-                _print_status(node)
+                st = node.node_status()
+                print(f"node_id={st['node_id']}")
+                print(f"tcp_port={st['tcp_port']}")
+                print(f"peers={st['peers']}")
+                print(f"known_manifests={st['known_manifests']}")
+                for fid, info in st["downloads"].items():
+                    print(f"{fid}: {info['done']}/{info['total']} -> {info['file']}")
             elif cmd == "trust" and len(parts) == 2:
                 node.trust_peer(parts[1])
                 print(f"{parts[1]} marked trusted.")
@@ -138,12 +118,45 @@ def _start(args):
         except Exception as exc:
             print(f"Command failed: {exc}")
 
+
+def _start(args):
+    node = init_node(args)
+    gemini = GeminiClient(enabled=not args.no_ai, api_key=args.ai_api_key)
+
+    print(f"Archipel node started: {node.node_id}")
+    if args.no_ai:
+        print("AI mode: disabled (--no-ai)")
+    else:
+        print("AI mode: enabled if GEMINI_API_KEY is configured")
+
+    if args.ui:
+        try:
+            from ui.web import run_ui
+        except ModuleNotFoundError:
+            print("UI unavailable: install dependencies with `pip install -r ../requirements.txt`")
+            node.running = False
+            return
+        if args.cli:
+            ui_thread = threading.Thread(
+                target=run_ui,
+                args=(node, gemini, args.ui_host, args.ui_port),
+                daemon=True,
+            )
+            ui_thread.start()
+            print(f"UI available at http://{args.ui_host}:{args.ui_port}")
+            run_cli(node, gemini)
+        else:
+            print(f"UI available at http://{args.ui_host}:{args.ui_port}")
+            run_ui(node, gemini, args.ui_host, args.ui_port)
+    else:
+        run_cli(node, gemini)
+
     print("Stopping node...")
     node.running = False
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Archipel CLI")
+    parser = argparse.ArgumentParser(description="Archipel CLI/UI")
     sub = parser.add_subparsers(dest="subcmd")
 
     start = sub.add_parser("start", help="Start a local Archipel node")
@@ -153,6 +166,10 @@ def build_parser():
     start.add_argument("--peer-db", default="peer_table.json")
     start.add_argument("--no-ai", action="store_true")
     start.add_argument("--ai-api-key", default=None)
+    start.add_argument("--ui", action="store_true", help="Start web UI")
+    start.add_argument("--ui-host", default="127.0.0.1")
+    start.add_argument("--ui-port", type=int, default=8080)
+    start.add_argument("--cli", action="store_true", help="Keep interactive CLI when UI is enabled")
 
     return parser
 
