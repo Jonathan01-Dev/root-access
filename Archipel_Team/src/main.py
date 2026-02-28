@@ -37,6 +37,8 @@ def print_help():
     print("  download <file_id> [output_path]")
     print("  status")
     print("  trust <node_id>")
+    print("  sign <node_id>")
+    print("  revoke")
     print("  quit")
 
 
@@ -117,6 +119,15 @@ def run_cli(node, gemini):
             elif cmd == "trust" and len(parts) == 2:
                 node.trust_peer(parts[1])
                 print(f"{parts[1]} marked trusted.")
+            elif cmd == "sign" and len(parts) == 2:
+                try:
+                    sig = node.sign_peer(parts[1])
+                    print(f"Signature created: {sig}")
+                except Exception as e:
+                    print(f"Sign failed: {e}")
+            elif cmd == "revoke":
+                node.revoke_self()
+                print("Revocation message broadcast.")
             else:
                 print("Unknown command. Type 'help'.")
         except Exception as exc:

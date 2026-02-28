@@ -108,11 +108,17 @@ PAGE = """
       </div>
 
       <div class="card">
-        <h3>Trust Peer</h3>
+        <h3>Trust / Sign Peer</h3>
         <label>Peer ID</label>
         <input id="trustPeer" placeholder="peer id">
         <button class="alt" onclick="trustPeer()">Trust</button>
+        <button onclick="signPeer()">Sign</button>
         <div id="trustResult" class="small"></div>
+      </div>
+      <div class="card">
+        <h3>Revoke Identity</h3>
+        <button class="alt" onclick="revokeSelf()">Broadcast Revocation</button>
+        <div id="revokeResult" class="small"></div>
       </div>
 
       <div class="card">
@@ -196,6 +202,16 @@ PAGE = """
         filepath: document.getElementById("sendPath").value
       });
       showResult("fileResult", payload);
+    }
+
+    async function signPeer() {
+      const payload = await post("/api/sign", { peer_id: document.getElementById("trustPeer").value });
+      showResult("trustResult", payload);
+    }
+
+    async function revokeSelf() {
+      const payload = await post("/api/revoke", {});
+      showResult("revokeResult", payload);
     }
 
     async function downloadFile() {
@@ -293,6 +309,27 @@ def create_app(node, gemini_client):
         try:
             node.trust_peer(peer_id)
             return jsonify({"ok": True, "message": f"{peer_id} trusted"})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)})
+
+    @app.post("/api/sign")
+    def sign():
+        body = request.get_json(force=True, silent=True) or {}
+        peer_id = (body.get("peer_id") or "").strip()
+        if not peer_id:
+            return jsonify({"ok": False, "error": "peer_id is required"})
+        try:
+            sig = node.sign_peer(peer_id)
+            return jsonify({"ok": True, "message": "Signature created", "signature": sig})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)})
+
+    @app.post("/api/revoke")
+    def revoke():
+        # no parameters needed
+        try:
+            node.revoke_self()
+            return jsonify({"ok": True, "message": "Revocation sent"})
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)})
 

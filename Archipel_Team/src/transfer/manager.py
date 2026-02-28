@@ -171,8 +171,18 @@ class DownloadManager:
         try:
             finished = sess.save_chunk(idx, resp['data'])
             print(f"[DL.handle] saved chunk {idx}, finished={finished}")
+            # reputation success
+            try:
+                self.node._update_reputation(peer_id, success=True)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[!] erreur enregistre chunk: {e}")
+            # reputation penalty
+            try:
+                self.node._update_reputation(peer_id, success=False)
+            except Exception:
+                pass
         # decrement inflight count
         with self.lock:
             if peer_id in self.peer_inflight and self.peer_inflight[peer_id] > 0:

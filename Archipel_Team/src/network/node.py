@@ -22,6 +22,15 @@ TYPE_CHUNK_REQ = 0x04
 TYPE_CHUNK_DATA= 0x05
 TYPE_MANIFEST  = 0x06
 
+# handshake / keep-alive types (TCP)
+TYPE_HS_HELLO       = 0x10
+TYPE_HS_HELLO_REPLY = 0x11
+TYPE_HS_AUTH        = 0x12
+TYPE_HS_AUTH_OK     = 0x13
+TYPE_PING           = 0x07
+TYPE_PONG           = 0x08
+TYPE_REVOCATION     = 0x09
+
 
 class ArchipelNode:
     def __init__(self, identity=None, tcp_port=None, db_file=None, local_ip=None):
@@ -41,10 +50,19 @@ class ArchipelNode:
         self.node_id = self.node_uid  # node_id = clé publique en hex
 
         self.peer_table = {}  # Module 1.2: Table de pairs
+        # table additionnelle pour la réputation et fichiers partagés, mise à jour
+        # lorsque des manifests sont reçus ou des chunks réussis/échoués.
+        # chaque entrée sera un dict contenant ip, tcp_port, last_seen, pubkey,
+        # trusted, shared_files(list), reputation(float)
         # stockage des manifests reÃ§us (file_id -> manifest dict)
         self.manifests = {}
         self.message_log = []
         self.event_log = []
+
+        # connexions TCP persistantes et clés de session après handshake
+        self.peer_connections = {}   # peer_id -> socket
+        self.session_keys = {}       # peer_id -> aes-gcm key bytes
+        self.peer_last_ping = {}     # peer_id -> timestamp of last received PONG
 
         # download manager (SprintÂ 4)
         from transfer.manager import DownloadManager
@@ -143,7 +161,317 @@ class ArchipelNode:
             return True
         return re.match(r"^[A-Za-z0-9_-]+$", node_id) is not None
 
-    # --- MODULE 1.2 : PERSISTANCE ---
+    # --- UTILS : encryption / session management ---
+    def _recv_exact(self, sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _derive_session_key(self, shared):
+        # HKDF-SHA256 per spec
+        from Crypto.Protocol.KDF import HKDF
+        return HKDF(shared, 32, b"", b"archipel-v1", hashlib.sha256)
+
+    def _encrypt_payload(self, key, plaintext: bytes) -> bytes:
+        from Crypto.Cipher import AES
+        nonce = os.urandom(12)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        ct, tag = cipher.encrypt_and_digest(plaintext)
+        return nonce + ct + tag
+
+    def _decrypt_payload(self, key, data: bytes) -> bytes:
+        from Crypto.Cipher import AES
+        nonce = data[:12]
+        tag = data[-16:]
+        ct = data[12:-16]
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ct, tag)
+
+    def _update_reputation(self, peer_id, success: bool):
+        entry = self.peer_table.get(peer_id)
+        if not entry:
+            return
+        rep = entry.get("reputation", 0.0)
+        # simple EWMA: success+=1, failure increments 0 weight
+        if success:
+            rep = min(1.0, rep + 0.1)
+        else:
+            rep = max(0.0, rep - 0.2)
+        entry["reputation"] = rep
+
+    def _keepalive_loop(self, peer_id):
+        # sends ping every 15s on an established connection
+        while self.running and peer_id in self.peer_connections:
+            try:
+                sock = self.peer_connections.get(peer_id)
+                if not sock:
+                    break
+                pkt = build_packet(TYPE_PING, self._packet_node_id_bytes(), b"", self.signing_key.encode(), hmac_key=self.session_keys.get(peer_id))
+                sock.sendall(pkt)
+            except Exception:
+                pass
+            time.sleep(15)
+
+    def _get_connection(self, peer_id):
+        """Return an open socket to the given peer, performing handshake if needed."""
+        if peer_id in self.peer_connections:
+            return self.peer_connections[peer_id]
+        info = self.peer_table.get(peer_id)
+        if not info:
+            raise KeyError(f"Pair inconnu: {peer_id}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((info['ip'], info['tcp_port']))
+        # perform handshake as initiator
+        try:
+            session = self._handshake_initiator(peer_id, sock)
+        except Exception as e:
+            sock.close()
+            raise
+        if session:
+            self.session_keys[peer_id] = session
+        self.peer_connections[peer_id] = sock
+        # reader and keepalive threads
+        threading.Thread(target=self._connection_reader, args=(sock, peer_id), daemon=True).start()
+        threading.Thread(target=self._keepalive_loop, args=(peer_id,), daemon=True).start()
+        return sock
+
+    def _handshake_initiator(self, peer_id, sock):
+        """Perform client side of the handshake over given socket. Returns session key."""
+        import nacl.public, nacl.signing, binascii
+        # ephemeral key pair
+        ep_priv = nacl.public.PrivateKey.generate()
+        ep_pub = ep_priv.public_key.encode()
+        # send HS_HELLO
+        payload = json.dumps({"e_pub": ep_pub.hex(), "timestamp": int(time.time())}).encode()
+        pkt = build_packet(TYPE_HS_HELLO, self._packet_node_id_bytes(), payload, self.signing_key.encode())
+        sock.sendall(pkt)
+        # await HS_HELLO_REPLY
+        header = self._recv_exact(sock, struct.calcsize(PACKET_FORMAT))
+        if not header or not header.startswith(b"ARCH"):
+            raise RuntimeError("Invalid handshake reply")
+        _, _, remote_id_bytes, payload_len = struct.unpack(PACKET_FORMAT, header)
+        remote_id = remote_id_bytes.hex()
+        payload = self._recv_exact(sock, payload_len)
+        sig = self._recv_exact(sock, 32)
+        pkt_type = header[4]
+        if pkt_type != TYPE_HS_HELLO_REPLY:
+            raise RuntimeError("Expected HS_HELLO_REPLY")
+        msg = json.loads(payload.decode())
+        remote_ep = bytes.fromhex(msg.get("e_pub", ""))
+        remote_sig = bytes.fromhex(msg.get("sig", ""))
+        # verify signature using permanent pubkey
+        entry = self.peer_table.get(remote_id)
+        if entry and entry.get("pubkey"):
+            peer_verify = nacl.signing.VerifyKey(bytes.fromhex(entry['pubkey']))
+            try:
+                peer_verify.verify(remote_ep, remote_sig)
+            except Exception:
+                raise RuntimeError("Handshake signature verification failed")
+        # derive shared secret
+        from nacl.bindings import crypto_scalarmult
+        shared = crypto_scalarmult(ep_priv.encode(), remote_ep)
+        session_key = self._derive_session_key(shared)
+        # send AUTH
+        shared_hash = hashlib.sha256(shared).digest()
+        auth_sig = self.signing_key.sign(shared_hash).signature
+        pkt = build_packet(TYPE_HS_AUTH, self._packet_node_id_bytes(), json.dumps({"sig": auth_sig.hex()}).encode(), self.signing_key.encode())
+        sock.sendall(pkt)
+        # wait for AUTH_OK
+        header = self._recv_exact(sock, struct.calcsize(PACKET_FORMAT))
+        if not header:
+            raise RuntimeError("Handshake failed (no auth ok)")
+        if header[4] != TYPE_HS_AUTH_OK:
+            raise RuntimeError("Handshake did not complete")
+        return session_key
+
+    def _handshake_responder(self, sock):
+        """Perform server side of handshake on incoming socket.
+        Returns (peer_id, session_key) or raises on failure.
+        """
+        import nacl.public, nacl.signing, binascii
+        # wait for HS_HELLO
+        header = self._recv_exact(sock, struct.calcsize(PACKET_FORMAT))
+        if not header or not header.startswith(b"ARCH"):
+            raise RuntimeError("Invalid handshake hello")
+        pkt_type = header[4]
+        if pkt_type != TYPE_HS_HELLO:
+            raise RuntimeError("Expected HS_HELLO")
+        _, _, remote_id_bytes, payload_len = struct.unpack(PACKET_FORMAT, header)
+        remote_id = remote_id_bytes.hex()
+        payload = self._recv_exact(sock, payload_len)
+        sig = self._recv_exact(sock, 32)
+        # extract ephemeral pub
+        msg = json.loads(payload.decode())
+        remote_ep = bytes.fromhex(msg.get("e_pub", ""))
+        # generate our own ephemeral and reply
+        ep_priv = nacl.public.PrivateKey.generate()
+        ep_pub = ep_priv.public_key.encode()
+        # sign our ephemeral public with permanent key
+        sig_bytes = self.signing_key.sign(ep_pub).signature
+        resp_payload = json.dumps({"e_pub": ep_pub.hex(), "sig": sig_bytes.hex()}).encode()
+        pkt = build_packet(TYPE_HS_HELLO_REPLY, self._packet_node_id_bytes(), resp_payload, self.signing_key.encode())
+        sock.sendall(pkt)
+        # derive shared
+        from nacl.bindings import crypto_scalarmult
+        shared = crypto_scalarmult(ep_priv.encode(), remote_ep)
+        session_key = self._derive_session_key(shared)
+        # wait for AUTH
+        header = self._recv_exact(sock, struct.calcsize(PACKET_FORMAT))
+        if not header or header[4] != TYPE_HS_AUTH:
+            raise RuntimeError("Handshake auth missing")
+        _, _, _, payload_len = struct.unpack(PACKET_FORMAT, header)
+        payload = self._recv_exact(sock, payload_len)
+        sig = self._recv_exact(sock, 32)
+        auth_msg = json.loads(payload.decode())
+        auth_sig = bytes.fromhex(auth_msg.get("sig", ""))
+        # verify signature of shared hash
+        shared_hash = hashlib.sha256(shared).digest()
+        # look up peer pubkey from peer_table if available
+        pub = None
+        if remote_id in self.peer_table:
+            pub = self.peer_table[remote_id].get('pubkey')
+        if pub:
+            peer_verify = nacl.signing.VerifyKey(bytes.fromhex(pub))
+            try:
+                peer_verify.verify(shared_hash, auth_sig)
+            except Exception:
+                raise RuntimeError("Auth signature invalid")
+        # send AUTH_OK
+        pkt = build_packet(TYPE_HS_AUTH_OK, self._packet_node_id_bytes(), b"", self.signing_key.encode(), hmac_key=session_key)
+        sock.sendall(pkt)
+        return remote_id, session_key
+
+    def _connection_reader(self, sock, peer_id=None):
+        """Loop reading messages from a socket that is already associated to a peer_id."""
+        try:
+            while self.running:
+                header = self._recv_exact(sock, struct.calcsize(PACKET_FORMAT))
+                if not header:
+                    break
+                if not header.startswith(b"ARCH"):
+                    continue
+                _, _, remote_id_bytes, payload_len = struct.unpack(PACKET_FORMAT, header)
+                payload = self._recv_exact(sock, payload_len)
+                sig = self._recv_exact(sock, 32)
+                remote_id = remote_id_bytes.hex()
+                # verify HMAC using session key if exists else signing key
+                key = self.session_keys.get(remote_id, self.signing_key.encode())
+                if not verify_hmac(header + (payload or b"") + (sig or b""), key):
+                    print("[!] HMAC verification failed for incoming packet")
+                    continue
+                pkt_type = header[4]
+                if pkt_type == TYPE_PING:
+                    # respond pong
+                    pong = build_packet(TYPE_PONG, self._packet_node_id_bytes(), b"", self.signing_key.encode(), hmac_key=self.session_keys.get(remote_id))
+                    sock.sendall(pong)
+                    continue
+                if pkt_type == TYPE_PONG:
+                    self.peer_last_ping[remote_id] = time.time()
+                    continue
+                # decrypt if encrypted
+                if remote_id in self.session_keys and payload:
+                    try:
+                        payload = self._decrypt_payload(self.session_keys[remote_id], payload)
+                    except Exception as e:
+                        print(f"[!] decrypt error: {e}")
+                        continue
+                # delegate to existing handler logic by temporarily reusing _handle_client
+                # we mimic a fake socket with data to reuse code
+                # simpler: call self._process_application_packet(remote_id, pkt_type, payload, sock, peer_id)
+                self._process_tcp_message(remote_id, pkt_type, payload, sock, peer_id)
+        except Exception as e:
+            print(f"[!] connection reader error: {e}")
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+            if peer_id and peer_id in self.peer_connections:
+                del self.peer_connections[peer_id]
+
+    def _process_tcp_message(self, remote_id, pkt_type, payload, sock, addr_or_peer):
+        """Extracted from original _handle_client: process a decrypted payload."""
+        # recreate minimal version of previous logic for msg, manifest, chunk req/data
+        try:
+            if pkt_type == TYPE_REVOCATION:
+                # peer announces its own key is revoked
+                info = json.loads(payload.decode())
+                raw = bytes.fromhex(info.get('payload',''))
+                sig = bytes.fromhex(info.get('sig',''))
+                # verify signature with peer's own public key if known
+                if remote_id in self.peer_table and self.peer_table[remote_id].get('pubkey'):
+                    import nacl.signing
+                    verify = nacl.signing.VerifyKey(bytes.fromhex(self.peer_table[remote_id]['pubkey']))
+                    try:
+                        verify.verify(raw, sig)
+                        print(f"[REVOCATION] received from {remote_id}")
+                        # mark peer as not trusted and remove from table
+                        self.peer_table[remote_id]['trusted'] = False
+                        self.peer_table[remote_id]['revoked'] = True
+                        self.save_peers()
+                    except Exception:
+                        print(f"[!] invalid revocation signature from {remote_id}")
+                return
+            if pkt_type == TYPE_MSG:
+                if remote_id:
+                    text = payload.decode(errors='ignore')
+                    print(f"[MSG] {remote_id} -> {text}")
+                    self.message_log.append({
+                        "ts": int(time.time()),
+                        "direction": "in",
+                        "peer": remote_id,
+                        "text": text,
+                    })
+                    if len(self.message_log) > 200:
+                        self.message_log = self.message_log[-200:]
+            elif pkt_type == TYPE_MANIFEST:
+                if remote_id:
+                    manifest = json.loads(payload.decode())
+                    print(f"[MANIFEST] reçu de {remote_id} id={manifest.get('file_id')}")
+                    self.manifests[manifest['file_id']] = manifest
+                    self.dl_manager.register_manifest(manifest, remote_id)
+                    self._log_event("transfer", f"Manifest received from {remote_id}: {manifest.get('file_id')}")
+                    # update peer shared files list
+                    entry = self.peer_table.get(remote_id)
+                    if entry:
+                        entry.setdefault('shared_files', []).append(manifest['file_id'])
+            elif pkt_type == TYPE_CHUNK_REQ:
+                req = json.loads(payload.decode())
+                fid = req['file_id']; idx = req['chunk_idx']
+                reply_port = req.get('reply_port', TCP_PORT)
+                print(f"[CHUNK_REQ] {addr_or_peer} file={fid} idx={idx} reply_port={reply_port}")
+                m = self.manifests.get(fid)
+                print(f"[DBG] manifest pour {fid}: {m is not None}")
+                if m:
+                    filepath = m.get('filepath')
+                    print(f"[DBG] filepath: {filepath}, exists: {os.path.exists(filepath) if filepath else False}")
+                    if filepath and os.path.exists(filepath):
+                        with open(filepath,'rb') as f:
+                            f.seek(idx * m['chunk_size'])
+                            data_chunk = f.read(m['chunks'][idx]['size'])
+                            resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
+                            node_id_bytes = self._packet_node_id_bytes()
+                            packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), self.signing_key.encode(), hmac_key=self.session_keys.get(remote_id), encrypt_key=self.session_keys.get(remote_id))
+                            requester_ip = addr_or_peer if isinstance(addr_or_peer, str) else addr_or_peer[0]
+                            try:
+                                with socket.create_connection((requester_ip, reply_port), timeout=5) as response_sock:
+                                    response_sock.sendall(packet)
+                                    print(f"[DBG] CHUNK_DATA sent back to {requester_ip}:{reply_port}, size={len(data_chunk)}")
+                            except Exception as e2:
+                                print(f"[!] Erreur envoi CHUNK_DATA back: {e2}")
+            elif pkt_type == TYPE_CHUNK_DATA:
+                resp = json.loads(payload.decode())
+                print(f"[CHUNK_DATA] reçu idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
+                if remote_id:
+                    self.dl_manager.handle_chunk_data(resp, remote_id)
+                    self._update_reputation(remote_id, success=True)
+        except Exception as e:
+            print(f"[!] processing tcp message failed: {e}")
     def save_peers(self):
         """Sauvegarde la table de pairs sur disque"""
         try:
@@ -202,6 +530,8 @@ class ArchipelNode:
                             "pubkey": info.get("pubkey"),
                             "trusted": bool(info.get("trusted", False)),
                             "trusted_at": int(info.get("trusted_at", 0) or 0),
+                            "shared_files": info.get("shared_files", []),
+                            "reputation": float(info.get("reputation", 0.0) or 0.0),
                         }
                 self.peer_table = cleaned
                 print(f"[*] {len(self.peer_table)} pairs chargÃ©s du disque.")
@@ -301,13 +631,26 @@ class ArchipelNode:
                             continue
                         # Mise Ã  jour Peer Table (Module 1.2)
                         prev = self.peer_table.get(remote_id)
+                        # check for pubkey change (MITM detection)
+                        if prev and 'pubkey' in prev and remote_pub and prev.get('pubkey') and prev.get('pubkey') != remote_pub:
+                            print(f"[!] PUBLIC KEY MISMATCH pour {remote_id} (possible MITM)")
+                            self._log_event("security", f"Pubkey mismatch for {remote_id}")
+                            # mark as untrusted
+                            prev['trusted'] = False
                         entry = {
                             "ip": addr_ip,
                             "tcp_port": tcp_port,
-                            "last_seen": time.time()
+                            "last_seen": time.time(),
+                            # default fields
+                            "shared_files": prev.get('shared_files', []) if prev else [],
+                            "reputation": prev.get('reputation', 0.0) if prev else 0.0,
                         }
                         if remote_pub:
                             entry['pubkey'] = remote_pub
+                        # preserve trusted flag if existed
+                        if prev and prev.get('trusted'):
+                            entry['trusted'] = True
+                            entry['trusted_at'] = prev.get('trusted_at', int(time.time()))
                         self.peer_table[remote_id] = entry
                         self.save_peers()
                         if prev is None:
@@ -339,24 +682,52 @@ class ArchipelNode:
 
     # --- MODULE 3.1/3.3 : MANIFEST & CHUNK TRANSFERT ---
     def send_manifest(self, target_ip, target_port, manifest):
-        """Envoie le manifest chiffrÃ© Ã  un pair donnÃ©"""
+        """Envoie le manifest Ã  un pair donnÃ© (via connection handshake)."""
+        # try to determine peer_id by matching ip/port in table
+        peer_id = None
+        for pid, info in self.peer_table.items():
+            if info.get('ip') == target_ip and info.get('tcp_port') == target_port:
+                peer_id = pid
+                break
         try:
-            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+            if peer_id:
+                sock = self._get_connection(peer_id)
+                session_key = self.session_keys.get(peer_id)
                 node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps(manifest).encode()
-                packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, self.signing_key.encode())
+                packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, self.signing_key.encode(), hmac_key=session_key, encrypt_key=session_key)
                 sock.sendall(packet)
+            else:
+                # fallback to simple TCP send if peer unknown
+                with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+                    node_id_bytes = self._packet_node_id_bytes()
+                    payload = json.dumps(manifest).encode()
+                    packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, self.signing_key.encode())
+                    sock.sendall(packet)
         except Exception as e:
             print(f"[!] Erreur send_manifest: {e}")
 
     def request_chunk(self, target_ip, target_port, file_id, chunk_idx):
-        """Demande un chunk via TCP"""
+        """Demande un chunk via TCP (avec handshake si possible)"""
+        peer_id = None
+        for pid, info in self.peer_table.items():
+            if info.get('ip') == target_ip and info.get('tcp_port') == target_port:
+                peer_id = pid
+                break
         try:
-            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+            if peer_id:
+                sock = self._get_connection(peer_id)
+                session_key = self.session_keys.get(peer_id)
                 node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": self.tcp_port}).encode()
-                packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, self.signing_key.encode())
+                packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, self.signing_key.encode(), hmac_key=session_key, encrypt_key=session_key)
                 sock.sendall(packet)
+            else:
+                with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+                    node_id_bytes = self._packet_node_id_bytes()
+                    payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": self.tcp_port}).encode()
+                    packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, self.signing_key.encode())
+                    sock.sendall(packet)
         except Exception as e:
             print(f"[!] Erreur request_chunk: {e}")
 
@@ -389,6 +760,38 @@ class ArchipelNode:
         self.peer_table[peer_id]["trusted_at"] = int(time.time())
         self.save_peers()
         self._log_event("security", f"Peer trusted: {peer_id}")
+
+    def sign_peer(self, peer_id):
+        """Signer la clÃ© publique d'un pair pour propagation dans le Web of Trust.
+
+        Retourne la signature hexadÃ©cimale.
+        """
+        info = self.peer_table.get(peer_id)
+        if not info or 'pubkey' not in info:
+            raise KeyError("Pair inconnu ou pas de clÃ© publique.")
+        pub = bytes.fromhex(info['pubkey'])
+        sig = self.signing_key.sign(pub).signature
+        info.setdefault('signatures', {})[self.node_id] = sig.hex()
+        self.save_peers()
+        return sig.hex()
+
+    def revoke_self(self):
+        """GÃ©nÃ¨re et diffuse un message de rÃ©vocation de sa propre clÃ©"""
+        rev = {
+            'node_id': self.node_id,
+            'timestamp': int(time.time())
+        }
+        payload = json.dumps(rev).encode()
+        sig = self.signing_key.sign(payload).signature.hex()
+        pkt = build_packet(TYPE_REVOCATION, self._packet_node_id_bytes(), json.dumps({'payload': payload.hex(), 'sig': sig}).encode(), self.signing_key.encode())
+        # broadcast unencrypted to all peers
+        for pid, info in list(self.peer_table.items()):
+            try:
+                sock = self._get_connection(pid)
+                sock.sendall(pkt)
+            except Exception:
+                pass
+        self._log_event("security", "Revocation message broadcast")
 
     def node_status(self):
         """Etat synthÃ©tique pour la CLI."""
@@ -434,26 +837,24 @@ class ArchipelNode:
         return box.decrypt(ciphertext)
 
     def send_message(self, peer_id, message: str):
-        """Envoie un message chiffrÃ© (type 0x03) au pair identifiÃ©."""
-        entry = self.peer_table.get(peer_id)
-        if not entry:
+        """Envoie un message (après handshake) chiffrÃ© avec la clÃ© de session."""
+        if peer_id not in self.peer_table:
             raise KeyError(f"Pair {peer_id} inconnu")
-        target_ip = entry['ip']
-        target_port = entry['tcp_port']
+        payload = message.encode()
         try:
-            ciphertext = self.encrypt_for_peer(peer_id, message.encode())
-            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
-                node_id_bytes = self._packet_node_id_bytes()
-                packet = build_packet(0x03, node_id_bytes, ciphertext, self.signing_key.encode())
-                sock.sendall(packet)
-                self.message_log.append({
-                    "ts": int(time.time()),
-                    "direction": "out",
-                    "peer": peer_id,
-                    "text": message,
-                })
-                if len(self.message_log) > 200:
-                    self.message_log = self.message_log[-200:]
+            sock = self._get_connection(peer_id)
+            session_key = self.session_keys.get(peer_id)
+            node_id_bytes = self._packet_node_id_bytes()
+            packet = build_packet(TYPE_MSG, node_id_bytes, payload, self.signing_key.encode(), hmac_key=session_key, encrypt_key=session_key)
+            sock.sendall(packet)
+            self.message_log.append({
+                "ts": int(time.time()),
+                "direction": "out",
+                "peer": peer_id,
+                "text": message,
+            })
+            if len(self.message_log) > 200:
+                self.message_log = self.message_log[-200:]
         except Exception as e:
             self._log_event("error", f"Message send failed to {peer_id}: {e}")
             raise RuntimeError(f"Erreur envoi message Ã  {peer_id}: {e}")
@@ -474,127 +875,25 @@ class ArchipelNode:
                 break
 
     def _handle_client(self, sock, addr):
-        """GÃ¨re les messages TCP entrants (TLV)"""
-        with sock:
+        """Accept incoming TCP connection, perform handshake, and then read messages."""
+        peer_id = None
+        try:
+            peer_id, session_key = self._handshake_responder(sock)
+            if peer_id:
+                self.session_keys[peer_id] = session_key
+                self.peer_connections[peer_id] = sock
+                threading.Thread(target=self._keepalive_loop, args=(peer_id,), daemon=True).start()
+                # block until connection closes
+                self._connection_reader(sock, peer_id)
+        except Exception as e:
+            print(f"[!] incoming handshake/connection failed from {addr}: {e}")
+        finally:
             try:
-                header_size = struct.calcsize(PACKET_FORMAT)
-                sig_len = 32
-
-                def recv_exact(n):
-                    buf = b""
-                    while len(buf) < n:
-                        chunk = sock.recv(n - len(buf))
-                        if not chunk:
-                            return None
-                        buf += chunk
-                    return buf
-
-                header = recv_exact(header_size)
-                if not header:
-                    return
-                if not header.startswith(b"ARCH"):
-                    return
-                try:
-                    _, _, _, payload_len = struct.unpack(PACKET_FORMAT, header)
-                except Exception:
-                    return
-                payload = recv_exact(payload_len)
-                sig = recv_exact(sig_len)
-                if payload is None or sig is None:
-                    return
-                data = header + payload + sig
-                if data and data.startswith(b"ARCH"):
-                    msg_type = data[4]
-                    # Resolve remote_id from packet header first; fallback to key match then IP.
-                    remote_id = data[5:37].hex()
-                    if remote_id not in self.peer_table:
-                        for pid, info in self.peer_table.items():
-                            if info.get("pubkey") == remote_id:
-                                remote_id = pid
-                                break
-                    if not remote_id or remote_id not in self.peer_table:
-                        remote_id = None
-                        for pid, info in self.peer_table.items():
-                            if info.get('ip') == addr[0]:
-                                remote_id = pid
-                                break
-                    if msg_type == TYPE_PEER_LIST:
-                        # Keep PEER_LIST for compatibility but avoid polluting local view.
-                        pass
-                    elif msg_type == TYPE_MSG:
-                        try:
-                            if remote_id:
-                                payload = data[struct.calcsize(PACKET_FORMAT):-32]
-                                plaintext = self.decrypt_from_peer(remote_id, payload)
-                                text = plaintext.decode(errors='ignore')
-                                print(f"[MSG] {remote_id} -> {text}")
-                                self.message_log.append({
-                                    "ts": int(time.time()),
-                                    "direction": "in",
-                                    "peer": remote_id,
-                                    "text": text,
-                                })
-                                if len(self.message_log) > 200:
-                                    self.message_log = self.message_log[-200:]
-                        except Exception as e:
-                            print(f"[!] Erreur dÃ©cryptage message: {e}")
-                    elif msg_type == TYPE_MANIFEST:
-                        try:
-                            if remote_id:
-                                payload = data[struct.calcsize(PACKET_FORMAT):-32]
-                                manifest = json.loads(payload.decode())
-                                print(f"[MANIFEST] reÃ§u de {remote_id} id={manifest.get('file_id')}")
-                                self.manifests[manifest['file_id']] = manifest
-                                # inform download manager
-                                self.dl_manager.register_manifest(manifest, remote_id)
-                                self._log_event("transfer", f"Manifest received from {remote_id}: {manifest.get('file_id')}")
-                        except Exception as e:
-                            print(f"[!] Erreur manifest: {e}")
-                    elif msg_type == TYPE_CHUNK_REQ:
-                        try:
-                            payload = data[struct.calcsize(PACKET_FORMAT):-32]
-                            req = json.loads(payload.decode())
-                            fid = req['file_id']; idx = req['chunk_idx']
-                            reply_port = req.get('reply_port', TCP_PORT)
-                            print(f"[CHUNK_REQ] {addr} file={fid} idx={idx} reply_port={reply_port}")
-                            # rechercher manifest local
-                            m = self.manifests.get(fid)
-                            print(f"[DBG] manifest pour {fid}: {m is not None}")
-                            if m:
-                                # Pas de vérification allowed_peers - tout pair peut télécharger
-                                filepath = m.get('filepath')
-                                print(f"[DBG] filepath: {filepath}, exists: {os.path.exists(filepath) if filepath else False}")
-                                if filepath and os.path.exists(filepath):
-                                    with open(filepath,'rb') as f:
-                                        f.seek(idx * m['chunk_size'])
-                                        data_chunk = f.read(m['chunks'][idx]['size'])
-                                        resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
-                                        node_id_bytes = self._packet_node_id_bytes()
-                                        packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), self.signing_key.encode())
-                                        # Send back to the requester on a NEW connection
-                                        requester_ip = addr[0]
-                                        try:
-                                            with socket.create_connection((requester_ip, reply_port), timeout=5) as response_sock:
-                                                response_sock.sendall(packet)
-                                                print(f"[DBG] CHUNK_DATA sent back to {requester_ip}:{reply_port}, size={len(data_chunk)}")
-                                        except Exception as e2:
-                                            print(f"[!] Erreur envoi CHUNK_DATA back: {e2}")
-                        except Exception as e:
-                            print(f"[!] Erreur CHUNK_REQ: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    elif msg_type == TYPE_CHUNK_DATA:
-                        try:
-                            payload = data[struct.calcsize(PACKET_FORMAT):-32]
-                            resp = json.loads(payload.decode())
-                            print(f"[CHUNK_DATA] reÃ§u idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
-                            # delegate to download manager
-                            if remote_id:
-                                self.dl_manager.handle_chunk_data(resp, remote_id)
-                        except Exception as e:
-                            print(f"[!] Erreur CHUNK_DATA: {e}")
-            except Exception as e:
-                print(f"[!] Erreur TCP client: {e}")
+                sock.close()
+            except:
+                pass
+            if peer_id and peer_id in self.peer_connections:
+                del self.peer_connections[peer_id]
 
     # --- MODULE 1.1 : TIMEOUT 90s ---
     def _garbage_collector(self):
@@ -640,7 +939,7 @@ if __name__ == "__main__":
     threading.Thread(target=status_loop, daemon=True).start()
 
     # --- CLI interactif minimal et commandes Sprint4
-    print("Commande: peers | msg <node_id> <texte> | manifest <file> | download <file_id> [path] | status | quit")
+    print("Commande: peers | msg <node_id> <texte> | send <peer_id> <file> | receive | download <file_id> [path] | status | trust <node_id> | quit")
     try:
         while True:
             try:
@@ -657,21 +956,30 @@ if __name__ == "__main__":
                     print(pid, info)
             elif parts[0] == 'msg' and len(parts) >= 3:
                 node.send_message(parts[1], parts[2])
-            elif parts[0] == 'manifest' and len(parts) == 2:
-                # envoie le manifest d'un fichier au premier peer (demo)
-                import transfer.manifest as mf
-                manifest = mf.create_manifest(parts[1])
-                manifest['filepath'] = parts[1]
-                # broadcast to all known peers
-                for pid, info in node.peer_table.items():
-                    node.send_manifest(info['ip'], info['tcp_port'], manifest)
-                print("Manifest envoyÃ©")
-            elif parts[0] == 'chunk' and len(parts) == 4:
-                _, dest, fid, idx = parts
-                for pid, info in node.peer_table.items():
-                    if pid == dest:
-                        node.request_chunk(info['ip'], info['tcp_port'], fid, int(idx))
-                        break
+            elif parts[0] == 'send' and len(parts) == 3:
+                # send a file manifest to the specified peer
+                try:
+                    fid = node.send_file(parts[1], parts[2])
+                    print(f"Manifest envoye; file_id={fid}")
+                except Exception as e:
+                    print(f"Erreur send: {e}")
+            elif parts[0] == 'receive':
+                if not node.dl_manager.sessions:
+                    print("Aucun fichier annonce.")
+                for fid, sess in node.dl_manager.sessions.items():
+                    done, total = sess.progress()
+                    print(f"{fid} | file={sess.save_path} | progress={done}/{total}")
+            elif parts[0] == 'download' and len(parts) >= 2:
+                fid = parts[1]
+                path = parts[2] if len(parts) == 3 else None
+                node.dl_manager.start_download(fid, path)
+                print(f"Demarrage download {fid}")
+            elif parts[0] == 'trust' and len(parts) == 2:
+                try:
+                    node.trust_peer(parts[1])
+                    print(f"{parts[1]} marque comme trusted.")
+                except Exception as e:
+                    print(f"Erreur trust: {e}")
             elif parts[0] == 'download' and len(parts) >= 2:
                 fid = parts[1]
                 path = parts[2] if len(parts) == 3 else None
