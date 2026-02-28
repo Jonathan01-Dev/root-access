@@ -49,6 +49,18 @@ class ArchipelNode:
         self.db_file = "peer_table.json"
         self.load_peers()  # Charger les pairs existants au démarrage
 
+    def _resolve_local_ip(self):
+        """Best-effort local IP selection without any internet dependency."""
+        try:
+            candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+            for cand in candidates:
+                ip = cand[4][0]
+                if not ip.startswith("127."):
+                    return ip
+        except Exception:
+            pass
+        return "0.0.0.0"
+
     # --- MODULE 1.2 : PERSISTANCE ---
     def save_peers(self):
         """Sauvegarde la table de pairs sur disque"""
@@ -107,11 +119,7 @@ class ArchipelNode:
 
         # Sélectionner automatiquement l'interface locale pour le multicast
         try:
-            # Détermine l'IP locale en créant un socket UDP vers l'extérieur
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
+            local_ip = self._resolve_local_ip()
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
         except Exception:
             local_ip = '0.0.0.0'
@@ -141,11 +149,7 @@ class ArchipelNode:
 
         # Joindre le groupe multicast sur l'interface locale si possible
         try:
-            # Détecte IP locale pour l'interface multicast
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
+            local_ip = self._resolve_local_ip()
             mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(local_ip))
         except Exception:
             mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
@@ -228,11 +232,52 @@ class ArchipelNode:
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
-                payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": TCP_PORT}).encode()
+                payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": self.tcp_port}).encode()
                 packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
         except Exception as e:
             print(f"[!] Erreur request_chunk: {e}")
+
+    def send_file(self, peer_id, filepath):
+        """Crée un manifest local et l'envoie à un pair précis."""
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(filepath)
+        entry = self.peer_table.get(peer_id)
+        if not entry:
+            raise KeyError(f"Pair inconnu: {peer_id}")
+        import transfer.manifest as mf
+        manifest = mf.create_manifest(filepath)
+        manifest["filepath"] = filepath
+        manifest["sender_id"] = self.node_id
+        self.manifests[manifest["file_id"]] = manifest
+        self.send_manifest(entry["ip"], entry["tcp_port"], manifest)
+        return manifest["file_id"]
+
+    def available_files(self):
+        """Retourne les manifests actuellement connus."""
+        return list(self.dl_manager.sessions.keys())
+
+    def trust_peer(self, peer_id):
+        """Marque un pair comme approuvé localement (TOFU simplifié)."""
+        if peer_id not in self.peer_table:
+            raise KeyError(f"Pair inconnu: {peer_id}")
+        self.peer_table[peer_id]["trusted"] = True
+        self.peer_table[peer_id]["trusted_at"] = int(time.time())
+        self.save_peers()
+
+    def node_status(self):
+        """Etat synthétique pour la CLI."""
+        status = {
+            "node_id": self.node_id,
+            "tcp_port": self.tcp_port,
+            "peers": len(self.peer_table),
+            "known_manifests": len(self.dl_manager.sessions),
+            "downloads": {},
+        }
+        for fid, sess in self.dl_manager.sessions.items():
+            done, total = sess.progress()
+            status["downloads"][fid] = {"done": done, "total": total, "file": sess.save_path}
+        return status
 
     # --- MODULE 2.1 & 2.4 : CHIFFREMENT E2E ---
     def encrypt_for_peer(self, peer_id, plaintext: bytes) -> bytes:
@@ -297,15 +342,42 @@ class ArchipelNode:
         """Gère les messages TCP entrants (TLV)"""
         with sock:
             try:
-                data = sock.recv(4096)
+                header_size = struct.calcsize(PACKET_FORMAT)
+                sig_len = 32
+
+                def recv_exact(n):
+                    buf = b""
+                    while len(buf) < n:
+                        chunk = sock.recv(n - len(buf))
+                        if not chunk:
+                            return None
+                        buf += chunk
+                    return buf
+
+                header = recv_exact(header_size)
+                if not header:
+                    return
+                if not header.startswith(b"ARCH"):
+                    return
+                try:
+                    _, _, _, payload_len = struct.unpack(PACKET_FORMAT, header)
+                except Exception:
+                    return
+                payload = recv_exact(payload_len)
+                sig = recv_exact(sig_len)
+                if payload is None or sig is None:
+                    return
+                data = header + payload + sig
                 if data and data.startswith(b"ARCH"):
                     msg_type = data[4]
-                    # resolve remote_id once at the beginning
-                    remote_id = None
-                    for pid, info in self.peer_table.items():
-                        if info.get('ip') == addr[0]:
-                            remote_id = pid
-                            break
+                    # Resolve remote_id from packet header first; fallback to peer_table by IP.
+                    remote_id = data[5:37].decode(errors='ignore').strip('\0')
+                    if not remote_id or remote_id not in self.peer_table:
+                        remote_id = None
+                        for pid, info in self.peer_table.items():
+                            if info.get('ip') == addr[0]:
+                                remote_id = pid
+                                break
                     if msg_type == TYPE_PEER_LIST:
                         print(f"[TCP] Peer List reçue de {addr[0]}")
                         # fusion simplifiée des tables
