@@ -141,9 +141,12 @@ class ArchipelNode:
         while self.running:
             try:
                 data, addr = sock.recvfrom(2048)
+<<<<<<< HEAD
                 # ne traiter que paquets commençant par le magic
                 if not data.startswith(b"ARCH"):
                     continue
+=======
+>>>>>>> 3602d7f85e9dcb3f8392a3dc8e2104bbf55e7313
                 # Parser header/payload en utilisant la spécification du protocole
                 try:
                     header_size = struct.calcsize(PACKET_FORMAT)
@@ -151,26 +154,39 @@ class ArchipelNode:
                     remote_id = data[5:37].decode(errors='ignore').strip('\0')
                     payload_raw = data[header_size:len(data)-sig_len]
                     tcp_port = TCP_PORT
+<<<<<<< HEAD
                     remote_pub = None
+=======
+>>>>>>> 3602d7f85e9dcb3f8392a3dc8e2104bbf55e7313
                     if payload_raw:
                         try:
                             info = json.loads(payload_raw.decode(errors='ignore'))
                             tcp_port = info.get('tcp_port', TCP_PORT)
+<<<<<<< HEAD
                             if 'pubkey' in info:
                                 remote_pub = info['pubkey']
+=======
+>>>>>>> 3602d7f85e9dcb3f8392a3dc8e2104bbf55e7313
                         except Exception:
                             pass
 
                     if remote_id != self.node_id:
                         # Mise à jour Peer Table (Module 1.2)
+<<<<<<< HEAD
                         entry = {
+=======
+                        self.peer_table[remote_id] = {
+>>>>>>> 3602d7f85e9dcb3f8392a3dc8e2104bbf55e7313
                             "ip": addr[0],
                             "tcp_port": tcp_port,
                             "last_seen": time.time()
                         }
+<<<<<<< HEAD
                         if remote_pub:
                             entry['pubkey'] = remote_pub
                         self.peer_table[remote_id] = entry
+=======
+>>>>>>> 3602d7f85e9dcb3f8392a3dc8e2104bbf55e7313
                         self.save_peers()
                         print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
 
