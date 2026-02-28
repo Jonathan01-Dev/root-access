@@ -3,9 +3,10 @@ import threading
 import time
 import json
 import struct
-# Importation depuis le fichier protocole.py que tu as créé
+import os
 from protocole import build_packet
 
+# Configuration conforme au document technique
 MCAST_GRP = '239.255.42.99'
 MCAST_PORT = 6000
 TCP_PORT = 7777
@@ -14,63 +15,99 @@ TCP_PORT = 7777
 class ArchipelNode:
     def __init__(self, node_id):
         self.node_id = node_id
-        self.peers = {}  # Peer Table : {node_id: {"ip": ip, "last_seen": time}}
+        self.peer_table = {}  # Module 1.2: Table de pairs
         self.running = True
+        self.db_file = "peer_table.json"
+        self.load_peers()  # Charger les pairs existants au démarrage
 
-    # --- PARTIE UDP : DECOUVERTE ---
+    # --- MODULE 1.2 : PERSISTANCE ---
+    def save_peers(self):
+        """Sauvegarde la table de pairs sur disque"""
+        try:
+            with open(self.db_file, "w") as f:
+                json.dump(self.peer_table, f)
+        except Exception as e:
+            print(f"[!] Erreur sauvegarde : {e}")
+
+    def load_peers(self):
+        """Charge la table de pairs depuis le disque"""
+        if os.path.exists(self.db_file):
+            try:
+                with open(self.db_file, "r") as f:
+                    self.peer_table = json.load(f)
+                print(f"[*] {len(self.peer_table)} pairs chargés du disque.")
+            except:
+                self.peer_table = {}
+
+    # --- MODULE 1.1 : DECOUVERTE (UDP) ---
     def _udp_announcer(self):
-        """Envoie des signaux HELLO toutes les 30 secondes"""
+        """Emet un signal HELLO toutes les 30 secondes"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-
-        # On s'assure que le NodeID fait bien 32 octets pour le header
         node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
 
         while self.running:
             try:
-                # Type 0x01 = HELLO
-                payload = json.dumps({"tcp_port": TCP_PORT}).encode()
-                # Signature de test pour le Sprint 1
-                packet = build_packet(0x01, node_id_bytes, payload, b"test_key_32_bytes_00000000000000")
+                # Payload avec timestamp pour le timeout
+                payload = json.dumps({
+                    "tcp_port": TCP_PORT,
+                    "timestamp": int(time.time())
+                }).encode()
+                packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
                 sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
-                # print(f"[UDP] Signal envoyé...") # Optionnel pour débug
             except Exception as e:
                 print(f"[!] Erreur Announcer: {e}")
             time.sleep(30)
 
     def _udp_listener(self):
-        """Ecoute les signaux des autres pairs sur le réseau local"""
+        """Ecoute les HELLO et déclenche l'envoi de la PEER_LIST en TCP"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', MCAST_PORT))
 
-        # Rejoindre le groupe multicast
         mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-        print(f"[*] Écoute UDP activée sur {MCAST_GRP}:{MCAST_PORT}")
 
         while self.running:
             try:
                 data, addr = sock.recvfrom(2048)
-                # Extraction du Node ID (octets 5 à 37 selon notre format de paquet)
-                remote_id_bytes = data[5:37]
-                remote_id = remote_id_bytes.decode(errors='ignore').strip('\0')
+                remote_id = data[5:37].decode(errors='ignore').strip('\0')
 
                 if remote_id != self.node_id:
-                    self.peers[remote_id] = {"ip": addr[0], "last_seen": time.time()}
-                    print(f"\n[+] Pair découvert : {remote_id} @ {addr[0]}")
-            except Exception as e:
+                    # Mise à jour Peer Table (Module 1.2)
+                    self.peer_table[remote_id] = {
+                        "ip": addr[0],
+                        "tcp_port": TCP_PORT,
+                        "last_seen": time.time()
+                    }
+                    self.save_peers()
+                    print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}")
+
+                    # Module 1.1 : Réponse PEER_LIST en unicast TCP
+                    threading.Thread(target=self.send_peer_list, args=(addr[0], TCP_PORT), daemon=True).start()
+            except:
                 pass
 
-    # --- PARTIE TCP : SERVEUR DE MESSAGERIE ---
+    # --- MODULE 1.1 & 1.3 : COMMUNICATION (TCP) ---
+    def send_peer_list(self, target_ip, target_port):
+        """Envoie la liste des pairs connus via TCP"""
+        try:
+            with socket.create_connection((target_ip, target_port), timeout=5) as sock:
+                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                # Type 0x02 = PEER_LIST
+                payload = json.dumps(self.peer_table).encode()
+                packet = build_packet(0x02, node_id_bytes, payload, b"test_secret_key")
+                sock.sendall(packet)
+        except:
+            pass  # Le pair n'est peut-être pas encore prêt en TCP
+
     def _tcp_server(self):
-        """Serveur TCP gérant les connexions entrantes (Capacité 10+)"""
+        """Serveur TCP gérant au moins 10 connexions (Module 1.3)"""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(('0.0.0.0', TCP_PORT))
         server.listen(10)
-        print(f"[*] Serveur TCP en attente sur le port {TCP_PORT}")
+        print(f"[*] Serveur TCP d'écoute activé sur le port {TCP_PORT}")
 
         while self.running:
             try:
@@ -80,37 +117,61 @@ class ArchipelNode:
                 break
 
     def _handle_client(self, sock, addr):
-        """Gère la réception de données d'un pair spécifique"""
+        """Gère les messages TCP entrants (TLV)"""
         with sock:
             try:
-                data = sock.recv(2048)
-                if data:
-                    print(f"\n[TCP] Données reçues de {addr}")
-                    # Ici on ajoutera le parsing des messages au Sprint 2
+                data = sock.recv(4096)
+                if data and data.startswith(b"ARCH"):
+                    msg_type = data[4]
+                    if msg_type == 0x02:  # Réception PEER_LIST
+                        print(f"[TCP] Peer List reçue de {addr[0]}")
+                        # Ici on pourrait fusionner les tables
             except Exception as e:
-                print(f"[!] Erreur client TCP: {e}")
+                print(f"[!] Erreur TCP client: {e}")
+
+    # --- MODULE 1.1 : TIMEOUT 90s ---
+    def _garbage_collector(self):
+        """Supprime les nœuds inactifs depuis plus de 90 secondes"""
+        while self.running:
+            now = time.time()
+            to_delete = []
+            for pid, info in self.peer_table.items():
+                if now - info['last_seen'] > 90:
+                    to_delete.append(pid)
+
+            for pid in to_delete:
+                print(f"\n[-] Nœud {pid} déconnecté (Timeout 90s)")
+                del self.peer_table[pid]
+
+            if to_delete:
+                self.save_peers()
+            time.sleep(10)
 
     def start(self):
-        """Lance tous les services en parallèle"""
+        """Lance les services réseau"""
         threading.Thread(target=self._udp_announcer, daemon=True).start()
         threading.Thread(target=self._udp_listener, daemon=True).start()
         threading.Thread(target=self._tcp_server, daemon=True).start()
-        print(f"--- Nœud Archipel [{self.node_id}] Démarré ---")
+        threading.Thread(target=self._garbage_collector, daemon=True).start()
+        print(f"--- Nœud Archipel [{self.node_id}] Opérationnel ---")
 
 
-# --- POINT D'ENTRÉE DU PROGRAMME ---
 if __name__ == "__main__":
-    # Change cet ID pour tester avec un autre nom
-    MON_ID = "AFRO_HACKER_01"
+    # Test S1: Utiliser un ID basé sur le temps pour lancer plusieurs instances sur le même PC
+    import random
 
-    node = ArchipelNode(MON_ID)
+    TEST_ID = f"NODE_{random.randint(1000, 9999)}"
+
+    node = ArchipelNode(TEST_ID)
     node.start()
 
-    # BOUCLE INFINIE pour maintenir le programme en vie
     try:
         while True:
-            # Affiche le nombre de pairs connus toutes les 60s (optionnel)
-            time.sleep(1)
+            # Affichage de l'état de la table toutes les 15s
+            print(f"\n[Peer Table] {len(node.peer_table)} pairs en ligne.")
+            for pid, info in node.peer_table.items():
+                print(f" - {pid} ({info['ip']})")
+            time.sleep(15)
     except KeyboardInterrupt:
-        print("\n[!] Arrêt du nœud en cours...")
+        print("\n[!] Arrêt du nœud...")
         node.running = False
