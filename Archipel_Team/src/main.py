@@ -24,7 +24,7 @@ def init_node(args):
         local_ip=args.local_ip,
     )
     if args.node_id is None:
-        node.node_id = node.verify_key.encode().hex()[:32]
+        node.node_id = node.node_uid
     node.start()
     return node
 

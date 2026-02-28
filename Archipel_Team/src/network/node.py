@@ -1,4 +1,4 @@
-import socket
+﻿import socket
 import threading
 import time
 import json
@@ -11,7 +11,7 @@ from .protocole import build_packet, PACKET_FORMAT
 # Configuration conforme au document technique
 MCAST_GRP = '239.255.42.99'
 MCAST_PORT = 6000
-# défaut, mais peut être surchargé via variable d'environnement pour tests
+# dÃ©faut, mais peut Ãªtre surchargÃ© via variable d'environnement pour tests
 TCP_PORT = int(os.environ.get('TCP_PORT', '7777'))
 
 # types de paquet
@@ -30,22 +30,23 @@ class ArchipelNode:
         self.tcp_port = tcp_port if tcp_port is not None else TCP_PORT
         # identite : tuple (signing_priv, verify_pub)
         if identity is None:
-            # essayer de charger clés depuis disque
+            # essayer de charger clÃ©s depuis disque
             self.signing_key, self.verify_key = self.load_identity()
         else:
             self.signing_key, self.verify_key = identity
 
-        # dérivés Curve25519 pour chiffrement
+        # dÃ©rivÃ©s Curve25519 pour chiffrement
         self.curve_priv = self.signing_key.to_curve25519_private_key()
         self.curve_pub = self.verify_key.to_curve25519_public_key()
+        self.node_uid = self.verify_key.encode().hex()
 
         self.peer_table = {}  # Module 1.2: Table de pairs
-        # stockage des manifests reçus (file_id -> manifest dict)
+        # stockage des manifests reÃ§us (file_id -> manifest dict)
         self.manifests = {}
         self.message_log = []
         self.event_log = []
 
-        # download manager (Sprint 4)
+        # download manager (SprintÂ 4)
         from transfer.manager import DownloadManager
         self.dl_manager = DownloadManager(self)
 
@@ -53,7 +54,10 @@ class ArchipelNode:
         self.db_file = db_file or "peer_table.json"
         self.local_ip = local_ip or os.environ.get("ARCHIPEL_LOCAL_IP")
         self.local_ips = self._resolve_local_ips()
-        self.load_peers()  # Charger les pairs existants au démarrage
+        self.load_peers()  # Charger les pairs existants au dÃ©marrage
+
+    def _packet_node_id_bytes(self):
+        return bytes.fromhex(self.node_uid)
 
     def _log_event(self, level, text):
         item = {"ts": int(time.time()), "level": level, "text": text}
@@ -135,6 +139,8 @@ class ArchipelNode:
     def _is_valid_node_id(node_id):
         if not node_id or len(node_id) > 64:
             return False
+        if re.match(r"^[0-9a-f]{64}$", node_id):
+            return True
         return re.match(r"^[A-Za-z0-9_-]+$", node_id) is not None
 
     # --- MODULE 1.2 : PERSISTANCE ---
@@ -148,11 +154,11 @@ class ArchipelNode:
 
     # --- MODULE CRYPTO : IDENTITE ---
     def load_identity(self):
-        """Charge une paire de clés Ed25519 depuis disque ou en crée une nouvelle.
+        """Charge une paire de clÃ©s Ed25519 depuis disque ou en crÃ©e une nouvelle.
 
-        Le chemin du fichier peut être personnalisé avec la variable
-        d'environnement `IDENTITY_FILE` pour permettre plusieurs nœuds sur la
-        même machine.
+        Le chemin du fichier peut Ãªtre personnalisÃ© avec la variable
+        d'environnement `IDENTITY_FILE` pour permettre plusieurs nÅ“uds sur la
+        mÃªme machine.
         """
         ident_file = os.environ.get('IDENTITY_FILE', 'identity.key')
         if os.path.exists(ident_file):
@@ -162,11 +168,11 @@ class ArchipelNode:
                 priv = nacl.signing.SigningKey(binascii.unhexlify(hexpriv))
                 return priv, priv.verify_key
             except Exception as e:
-                print(f"[!] Impossible de charger identité : {e}")
-        # générer nouvelle identité
+                print(f"[!] Impossible de charger identitÃ© : {e}")
+        # gÃ©nÃ©rer nouvelle identitÃ©
         from crypto.identite import generate_identity
         priv, pub = generate_identity()
-        # enregistrer la clé privée en hex
+        # enregistrer la clÃ© privÃ©e en hex
         import binascii
         with open(ident_file, "w") as f:
             f.write(binascii.hexlify(priv.encode()).decode())
@@ -198,14 +204,14 @@ class ArchipelNode:
                             "trusted_at": int(info.get("trusted_at", 0) or 0),
                         }
                 self.peer_table = cleaned
-                print(f"[*] {len(self.peer_table)} pairs chargés du disque.")
+                print(f"[*] {len(self.peer_table)} pairs chargÃ©s du disque.")
             except:
                 self.peer_table = {}
 
     # --- MODULE 1.1 : DECOUVERTE (UDP) ---
     def _udp_announcer(self):
         """Emet un signal HELLO toutes les 30 secondes"""
-        node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+        node_id_bytes = self._packet_node_id_bytes()
         send_ips = [self.local_ips[0]] if self.local_ips else ["0.0.0.0"]
 
         while self.running:
@@ -221,17 +227,16 @@ class ArchipelNode:
                 except Exception:
                     pass
                 try:
-                    # Payload avec timestamp pour le timeout et notre clé publique
+                    # Payload avec timestamp pour le timeout et notre clÃ© publique
                     import binascii
                     payload = json.dumps({
                         "tcp_port": self.tcp_port,
                         "timestamp": int(time.time()),
                         "pubkey": binascii.hexlify(self.verify_key.encode()).decode(),
-                        "announce_ip": local_ip,
-                    }).encode()
+                                            }).encode()
                     packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
                     sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
-                    print(f"[DBG] HELLO envoyé depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
+                    print(f"[DBG] HELLO envoyÃ© depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
                 except Exception as e:
                     print(f"[!] Erreur Announcer({local_ip}): {e}")
                 finally:
@@ -239,7 +244,7 @@ class ArchipelNode:
             time.sleep(30)
 
     def _udp_listener(self):
-        """Ecoute les HELLO et déclenche l'envoi de la PEER_LIST en TCP"""
+        """Ecoute les HELLO et dÃ©clenche l'envoi de la PEER_LIST en TCP"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', MCAST_PORT))
@@ -264,39 +269,37 @@ class ArchipelNode:
         while self.running:
             try:
                 data, addr = sock.recvfrom(2048)
-                # ne traiter que paquets commençant par le magic
+                # ne traiter que paquets commenÃ§ant par le magic
                 if not data.startswith(b"ARCH"):
                     continue
-                # Parser header/payload en utilisant la spécification du protocole
+                # Parser header/payload en utilisant la spÃ©cification du protocole
                 try:
                     header_size = struct.calcsize(PACKET_FORMAT)
                     sig_len = 32
-                    remote_id = data[5:37].decode(errors='ignore').strip('\0')
+                    remote_id = data[5:37].hex()
                     payload_raw = data[header_size:len(data)-sig_len]
                     tcp_port = TCP_PORT
                     remote_pub = None
+                    addr_ip = addr[0]
                     if payload_raw:
                         try:
                             info = json.loads(payload_raw.decode(errors='ignore'))
                             tcp_port = info.get('tcp_port', TCP_PORT)
                             if 'pubkey' in info:
-                                remote_pub = info['pubkey']
-                            if "announce_ip" in info and isinstance(info["announce_ip"], str):
-                                addr_ip = info["announce_ip"]
-                            else:
-                                addr_ip = addr[0]
+                                remote_pub = str(info['pubkey']).lower()
+                                if re.match(r"^[0-9a-f]{64}$", remote_pub):
+                                    remote_id = remote_pub
+                            addr_ip = addr[0]
                         except Exception:
                             addr_ip = addr[0]
-                    else:
-                        addr_ip = addr[0]
 
                     if not self._is_valid_node_id(remote_id):
                         continue
-                    if remote_id != self.node_id:
+                    if remote_id != self.node_uid:
                         # Ignore peers not in our local LAN scope.
                         if not self._is_local_candidate_ip(addr_ip):
                             continue
-                        # Mise à jour Peer Table (Module 1.2)
+                        # Mise Ã  jour Peer Table (Module 1.2)
                         prev = self.peer_table.get(remote_id)
                         entry = {
                             "ip": addr_ip,
@@ -311,10 +314,10 @@ class ArchipelNode:
                             print(f"\n[+] Nouveau pair : {remote_id} @ {addr_ip}:{tcp_port}")
                             self._log_event("info", f"New peer: {remote_id} @ {addr_ip}:{tcp_port}")
                         elif prev.get("ip") != addr_ip or prev.get("tcp_port") != tcp_port:
-                            print(f"\n[~] Pair mis à jour : {remote_id} @ {addr_ip}:{tcp_port}")
+                            print(f"\n[~] Pair mis Ã  jour : {remote_id} @ {addr_ip}:{tcp_port}")
                             self._log_event("info", f"Peer endpoint changed: {remote_id} @ {addr_ip}:{tcp_port}")
 
-                        # Module 1.1 : Réponse PEER_LIST en unicast TCP
+                        # Module 1.1 : RÃ©ponse PEER_LIST en unicast TCP
                         threading.Thread(target=self.send_peer_list, args=(addr_ip, tcp_port), daemon=True).start()
                 except Exception as e:
                     print(f"[!] Erreur parsing UDP packet: {e}")
@@ -323,23 +326,23 @@ class ArchipelNode:
 
     # --- MODULE 1.1 & 1.3 : COMMUNICATION (TCP) ---
     def send_peer_list(self, target_ip, target_port):
-        """Envoie la liste des pairs connus via TCP (non chiffrée)."""
+        """Envoie la liste des pairs connus via TCP (non chiffrÃ©e)."""
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
-                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                node_id_bytes = self._packet_node_id_bytes()
                 # Type PEER_LIST
                 payload = json.dumps(self.peer_table).encode()
                 packet = build_packet(TYPE_PEER_LIST, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
         except Exception:
-            pass  # Le pair n'est peut-être pas encore prêt en TCP
+            pass  # Le pair n'est peut-Ãªtre pas encore prÃªt en TCP
 
     # --- MODULE 3.1/3.3 : MANIFEST & CHUNK TRANSFERT ---
     def send_manifest(self, target_ip, target_port, manifest):
-        """Envoie le manifest chiffré à un pair donné"""
+        """Envoie le manifest chiffrÃ© Ã  un pair donnÃ©"""
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
-                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps(manifest).encode()
                 packet = build_packet(TYPE_MANIFEST, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
@@ -350,7 +353,7 @@ class ArchipelNode:
         """Demande un chunk via TCP"""
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
-                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                node_id_bytes = self._packet_node_id_bytes()
                 payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": self.tcp_port}).encode()
                 packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
@@ -358,7 +361,7 @@ class ArchipelNode:
             print(f"[!] Erreur request_chunk: {e}")
 
     def send_file(self, peer_id, filepath):
-        """Crée un manifest local et l'envoie à un pair précis."""
+        """CrÃ©e un manifest local et l'envoie Ã  un pair prÃ©cis."""
         if not os.path.exists(filepath):
             raise FileNotFoundError(filepath)
         entry = self.peer_table.get(peer_id)
@@ -367,7 +370,7 @@ class ArchipelNode:
         import transfer.manifest as mf
         manifest = mf.create_manifest(filepath)
         manifest["filepath"] = filepath
-        manifest["sender_id"] = self.node_id
+        manifest["sender_id"] = self.node_uid
         self.manifests[manifest["file_id"]] = manifest
         self.send_manifest(entry["ip"], entry["tcp_port"], manifest)
         self._log_event("info", f"Manifest sent to {peer_id}: {manifest['file_id']}")
@@ -378,7 +381,7 @@ class ArchipelNode:
         return list(self.dl_manager.sessions.keys())
 
     def trust_peer(self, peer_id):
-        """Marque un pair comme approuvé localement (TOFU simplifié)."""
+        """Marque un pair comme approuvÃ© localement (TOFU simplifiÃ©)."""
         if peer_id not in self.peer_table:
             raise KeyError(f"Pair inconnu: {peer_id}")
         self.peer_table[peer_id]["trusted"] = True
@@ -387,9 +390,9 @@ class ArchipelNode:
         self._log_event("security", f"Peer trusted: {peer_id}")
 
     def node_status(self):
-        """Etat synthétique pour la CLI."""
+        """Etat synthÃ©tique pour la CLI."""
         status = {
-            "node_id": self.node_id,
+            "node_id": self.node_uid,
             "tcp_port": self.tcp_port,
             "peers": len(self.peer_table),
             "known_manifests": len(self.dl_manager.sessions),
@@ -404,12 +407,12 @@ class ArchipelNode:
 
     # --- MODULE 2.1 & 2.4 : CHIFFREMENT E2E ---
     def encrypt_for_peer(self, peer_id, plaintext: bytes) -> bytes:
-        """Retourne des données chiffrées pour le pair donné en utilisant NaCl Box."""
+        """Retourne des donnÃ©es chiffrÃ©es pour le pair donnÃ© en utilisant NaCl Box."""
         import nacl.public
         import nacl.signing
         entry = self.peer_table.get(peer_id)
         if not entry or 'pubkey' not in entry:
-            raise ValueError("Clé publique du pair inconnue")
+            raise ValueError("ClÃ© publique du pair inconnue")
         peer_pub = bytes.fromhex(entry['pubkey'])
         # convertir pubkey Ed25519 en Curve25519
         peer_verify = nacl.signing.VerifyKey(peer_pub)
@@ -422,7 +425,7 @@ class ArchipelNode:
         import nacl.signing
         entry = self.peer_table.get(peer_id)
         if not entry or 'pubkey' not in entry:
-            raise ValueError("Clé publique du pair inconnue")
+            raise ValueError("ClÃ© publique du pair inconnue")
         peer_pub = bytes.fromhex(entry['pubkey'])
         peer_verify = nacl.signing.VerifyKey(peer_pub)
         peer_curve = peer_verify.to_curve25519_public_key()
@@ -430,7 +433,7 @@ class ArchipelNode:
         return box.decrypt(ciphertext)
 
     def send_message(self, peer_id, message: str):
-        """Envoie un message chiffré (type 0x03) au pair identifié."""
+        """Envoie un message chiffrÃ© (type 0x03) au pair identifiÃ©."""
         entry = self.peer_table.get(peer_id)
         if not entry:
             raise KeyError(f"Pair {peer_id} inconnu")
@@ -439,7 +442,7 @@ class ArchipelNode:
         try:
             ciphertext = self.encrypt_for_peer(peer_id, message.encode())
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
-                node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+                node_id_bytes = self._packet_node_id_bytes()
                 packet = build_packet(0x03, node_id_bytes, ciphertext, b"test_secret_key")
                 sock.sendall(packet)
                 self.message_log.append({
@@ -452,15 +455,15 @@ class ArchipelNode:
                     self.message_log = self.message_log[-200:]
         except Exception as e:
             self._log_event("error", f"Message send failed to {peer_id}: {e}")
-            raise RuntimeError(f"Erreur envoi message à {peer_id}: {e}")
+            raise RuntimeError(f"Erreur envoi message Ã  {peer_id}: {e}")
 
     def _tcp_server(self):
-        """Serveur TCP gérant au moins 10 connexions (Module 1.3)"""
+        """Serveur TCP gÃ©rant au moins 10 connexions (Module 1.3)"""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(('0.0.0.0', self.tcp_port))
         server.listen(10)
-        print(f"[*] Serveur TCP d'écoute activé sur le port {self.tcp_port}")
+        print(f"[*] Serveur TCP d'Ã©coute activÃ© sur le port {self.tcp_port}")
 
         while self.running:
             try:
@@ -470,7 +473,7 @@ class ArchipelNode:
                 break
 
     def _handle_client(self, sock, addr):
-        """Gère les messages TCP entrants (TLV)"""
+        """GÃ¨re les messages TCP entrants (TLV)"""
         with sock:
             try:
                 header_size = struct.calcsize(PACKET_FORMAT)
@@ -501,8 +504,13 @@ class ArchipelNode:
                 data = header + payload + sig
                 if data and data.startswith(b"ARCH"):
                     msg_type = data[4]
-                    # Resolve remote_id from packet header first; fallback to peer_table by IP.
-                    remote_id = data[5:37].decode(errors='ignore').strip('\0')
+                    # Resolve remote_id from packet header first; fallback to key match then IP.
+                    remote_id = data[5:37].hex()
+                    if remote_id not in self.peer_table:
+                        for pid, info in self.peer_table.items():
+                            if info.get("pubkey") == remote_id:
+                                remote_id = pid
+                                break
                     if not remote_id or remote_id not in self.peer_table:
                         remote_id = None
                         for pid, info in self.peer_table.items():
@@ -510,42 +518,8 @@ class ArchipelNode:
                                 remote_id = pid
                                 break
                     if msg_type == TYPE_PEER_LIST:
-                        print(f"[TCP] Peer List reçue de {addr[0]}")
-                        # fusion simplifiée des tables
-                        try:
-                            peers = json.loads(data[struct.calcsize(PACKET_FORMAT):-32].decode())
-                            now = time.time()
-                            if isinstance(peers, dict):
-                                for pid, info in peers.items():
-                                    if not self._is_valid_node_id(pid):
-                                        continue
-                                    if pid == self.node_id:
-                                        continue
-                                    if not isinstance(info, dict):
-                                        continue
-                                    ip = info.get("ip")
-                                    port = info.get("tcp_port")
-                                    last_seen = float(info.get("last_seen", 0) or 0)
-                                    if not ip or not isinstance(port, int):
-                                        continue
-                                    if not self._is_local_candidate_ip(ip):
-                                        continue
-                                    # Reject stale peer list entries to avoid pollution.
-                                    if last_seen and (now - last_seen) > 120:
-                                        continue
-                                    cur = self.peer_table.get(pid)
-                                    if not cur or (last_seen and last_seen > float(cur.get("last_seen", 0) or 0)):
-                                        self.peer_table[pid] = {
-                                            "ip": ip,
-                                            "tcp_port": port,
-                                            "last_seen": last_seen or now,
-                                            "pubkey": info.get("pubkey"),
-                                            "trusted": bool(info.get("trusted", False)),
-                                            "trusted_at": int(info.get("trusted_at", 0) or 0),
-                                        }
-                                self.save_peers()
-                        except Exception:
-                            pass
+                        # Keep PEER_LIST for compatibility but avoid polluting local view.
+                        pass
                     elif msg_type == TYPE_MSG:
                         try:
                             if remote_id:
@@ -562,13 +536,13 @@ class ArchipelNode:
                                 if len(self.message_log) > 200:
                                     self.message_log = self.message_log[-200:]
                         except Exception as e:
-                            print(f"[!] Erreur décryptage message: {e}")
+                            print(f"[!] Erreur dÃ©cryptage message: {e}")
                     elif msg_type == TYPE_MANIFEST:
                         try:
                             if remote_id:
                                 payload = data[struct.calcsize(PACKET_FORMAT):-32]
                                 manifest = json.loads(payload.decode())
-                                print(f"[MANIFEST] reçu de {remote_id} id={manifest.get('file_id')}")
+                                print(f"[MANIFEST] reÃ§u de {remote_id} id={manifest.get('file_id')}")
                                 self.manifests[manifest['file_id']] = manifest
                                 # inform download manager
                                 self.dl_manager.register_manifest(manifest, remote_id)
@@ -593,7 +567,7 @@ class ArchipelNode:
                                         f.seek(idx * m['chunk_size'])
                                         data_chunk = f.read(m['chunks'][idx]['size'])
                                         resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
-                                        node_id_bytes = self.node_id.encode().ljust(32,b'\0')[:32]
+                                        node_id_bytes = self._packet_node_id_bytes()
                                         packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), b"test_secret_key")
                                         # Send back to the requester on a NEW connection
                                         requester_ip = addr[0]
@@ -611,7 +585,7 @@ class ArchipelNode:
                         try:
                             payload = data[struct.calcsize(PACKET_FORMAT):-32]
                             resp = json.loads(payload.decode())
-                            print(f"[CHUNK_DATA] reçu idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
+                            print(f"[CHUNK_DATA] reÃ§u idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
                             # delegate to download manager
                             if remote_id:
                                 self.dl_manager.handle_chunk_data(resp, remote_id)
@@ -622,7 +596,7 @@ class ArchipelNode:
 
     # --- MODULE 1.1 : TIMEOUT 90s ---
     def _garbage_collector(self):
-        """Supprime les nœuds inactifs depuis plus de 90 secondes"""
+        """Supprime les nÅ“uds inactifs depuis plus de 90 secondes"""
         while self.running:
             now = time.time()
             to_delete = []
@@ -631,7 +605,7 @@ class ArchipelNode:
                     to_delete.append(pid)
 
             for pid in to_delete:
-                print(f"\n[-] Nœud {pid} déconnecté (Timeout 90s)")
+                print(f"\n[-] NÅ“ud {pid} dÃ©connectÃ© (Timeout 90s)")
                 del self.peer_table[pid]
 
             if to_delete:
@@ -639,16 +613,16 @@ class ArchipelNode:
             time.sleep(10)
 
     def start(self):
-        """Lance les services réseau"""
+        """Lance les services rÃ©seau"""
         threading.Thread(target=self._udp_announcer, daemon=True).start()
         threading.Thread(target=self._udp_listener, daemon=True).start()
         threading.Thread(target=self._tcp_server, daemon=True).start()
         threading.Thread(target=self._garbage_collector, daemon=True).start()
-        print(f"--- Nœud Archipel [{self.node_id}] Opérationnel ---")
+        print(f"--- NÅ“ud Archipel [{self.node_id}] OpÃ©rationnel ---")
 
 
 if __name__ == "__main__":
-    # Test S1: Utiliser un ID basé sur le temps pour lancer plusieurs instances sur le même PC
+    # Test S1: Utiliser un ID basÃ© sur le temps pour lancer plusieurs instances sur le mÃªme PC
     import random
 
     TEST_ID = f"NODE_{random.randint(1000, 9999)}"
@@ -656,7 +630,7 @@ if __name__ == "__main__":
     node = ArchipelNode(TEST_ID)
     node.start()
 
-    # thread affichant périodiquement la table de pairs
+    # thread affichant pÃ©riodiquement la table de pairs
     def status_loop():
         while node.running:
             print(f"\n[Peer Table] {len(node.peer_table)} pairs en ligne.")
@@ -693,7 +667,7 @@ if __name__ == "__main__":
                 # broadcast to all known peers
                 for pid, info in node.peer_table.items():
                     node.send_manifest(info['ip'], info['tcp_port'], manifest)
-                print("Manifest envoyé")
+                print("Manifest envoyÃ©")
             elif parts[0] == 'chunk' and len(parts) == 4:
                 _, dest, fid, idx = parts
                 for pid, info in node.peer_table.items():
@@ -705,9 +679,9 @@ if __name__ == "__main__":
                 path = parts[2] if len(parts) == 3 else None
                 try:
                     node.dl_manager.start_download(fid, path)
-                    print(f"[DL] démarrage du téléchargement {fid}")
+                    print(f"[DL] dÃ©marrage du tÃ©lÃ©chargement {fid}")
                 except Exception as e:
-                    print(f"[!] impossible de démarrer download: {e}")
+                    print(f"[!] impossible de dÃ©marrer download: {e}")
             elif parts[0] == 'status':
                 for fid, sess in node.dl_manager.sessions.items():
                     done, total = sess.progress()
@@ -717,5 +691,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        print("\n[!] Arrêt du nœud...")
+        print("\n[!] ArrÃªt du nÅ“ud...")
         node.running = False
+
+
