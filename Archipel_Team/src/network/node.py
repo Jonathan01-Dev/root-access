@@ -5,6 +5,7 @@ import json
 import struct
 import os
 import re
+import ipaddress
 from .protocole import build_packet, PACKET_FORMAT
 
 # Configuration conforme au document technique
@@ -51,6 +52,7 @@ class ArchipelNode:
         self.running = True
         self.db_file = db_file or "peer_table.json"
         self.local_ip = local_ip or os.environ.get("ARCHIPEL_LOCAL_IP")
+        self.local_ips = self._resolve_local_ips()
         self.load_peers()  # Charger les pairs existants au démarrage
 
     def _log_event(self, level, text):
@@ -61,8 +63,17 @@ class ArchipelNode:
 
     def _resolve_local_ip(self):
         """Best-effort local IP selection without any internet dependency."""
+        ips = self._resolve_local_ips()
+        if ips:
+            return ips[0]
+        return "0.0.0.0"
+
+    def _resolve_local_ips(self):
+        """Return candidate local IPv4 interfaces for multicast."""
         if self.local_ip:
-            return self.local_ip
+            return [self.local_ip]
+
+        found = []
         try:
             # Route-based selection without internet traffic.
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -70,7 +81,7 @@ class ArchipelNode:
             ip = s.getsockname()[0]
             s.close()
             if ip and not ip.startswith("127."):
-                return ip
+                found.append(ip)
         except Exception:
             pass
         try:
@@ -78,10 +89,47 @@ class ArchipelNode:
             for cand in candidates:
                 ip = cand[4][0]
                 if not ip.startswith("127."):
-                    return ip
+                    found.append(ip)
         except Exception:
             pass
-        return "0.0.0.0"
+        # Keep private IPv4 first and de-duplicate while preserving order.
+        uniq = []
+        for ip in found:
+            if ip not in uniq:
+                uniq.append(ip)
+
+        def score(ip):
+            try:
+                obj = ipaddress.ip_address(ip)
+                if not obj.is_private:
+                    return 99
+                # Prefer 192.168.x.x for common LAN demos, then 10.x, then 172.16/12.
+                if ip.startswith("192.168."):
+                    return 0
+                if ip.startswith("10."):
+                    return 1
+                if ip.startswith("172."):
+                    return 2
+                return 5
+            except Exception:
+                return 100
+
+        uniq.sort(key=score)
+        return uniq
+
+    def _same_subnet(self, ip_a, ip_b):
+        """Simple /24 subnet check for LAN filtering."""
+        try:
+            a = ipaddress.ip_address(ip_a)
+            b = ipaddress.ip_address(ip_b)
+            if a.version != 4 or b.version != 4:
+                return False
+            return ".".join(ip_a.split(".")[:3]) == ".".join(ip_b.split(".")[:3])
+        except Exception:
+            return False
+
+    def _is_local_candidate_ip(self, ip):
+        return any(self._same_subnet(ip, local) or ip == local for local in self.local_ips)
 
     @staticmethod
     def _is_valid_node_id(node_id):
@@ -157,36 +205,37 @@ class ArchipelNode:
     # --- MODULE 1.1 : DECOUVERTE (UDP) ---
     def _udp_announcer(self):
         """Emet un signal HELLO toutes les 30 secondes"""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
-        # Activer le loopback pour voir ses propres annonces en local
-        try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-        except Exception:
-            pass
-
-        # Sélectionner automatiquement l'interface locale pour le multicast
-        try:
-            local_ip = self._resolve_local_ip()
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
-        except Exception:
-            local_ip = '0.0.0.0'
         node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
+        send_ips = [self.local_ips[0]] if self.local_ips else ["0.0.0.0"]
 
         while self.running:
-            try:
-                # Payload avec timestamp pour le timeout et notre clé publique
-                import binascii
-                payload = json.dumps({
-                    "tcp_port": self.tcp_port,
-                    "timestamp": int(time.time()),
-                    "pubkey": binascii.hexlify(self.verify_key.encode()).decode()
-                }).encode()
-                packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
-                sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
-                print(f"[DBG] HELLO envoyé depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
-            except Exception as e:
-                print(f"[!] Erreur Announcer: {e}")
+            for local_ip in send_ips:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                except Exception:
+                    pass
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
+                except Exception:
+                    pass
+                try:
+                    # Payload avec timestamp pour le timeout et notre clé publique
+                    import binascii
+                    payload = json.dumps({
+                        "tcp_port": self.tcp_port,
+                        "timestamp": int(time.time()),
+                        "pubkey": binascii.hexlify(self.verify_key.encode()).decode(),
+                        "announce_ip": local_ip,
+                    }).encode()
+                    packet = build_packet(0x01, node_id_bytes, payload, b"test_secret_key")
+                    sock.sendto(packet, (MCAST_GRP, MCAST_PORT))
+                    print(f"[DBG] HELLO envoyé depuis {local_ip} vers {MCAST_GRP}:{MCAST_PORT}")
+                except Exception as e:
+                    print(f"[!] Erreur Announcer({local_ip}): {e}")
+                finally:
+                    sock.close()
             time.sleep(30)
 
     def _udp_listener(self):
@@ -195,17 +244,22 @@ class ArchipelNode:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', MCAST_PORT))
 
-        # Joindre le groupe multicast sur l'interface locale si possible
-        try:
-            local_ip = self._resolve_local_ip()
-            mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(local_ip))
-        except Exception:
-            mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
-
-        try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except Exception as e:
-            print(f"[!] Erreur JOIN_MEMBERSHIP: {e}")
+        joined = False
+        # Join multicast on every detected local interface.
+        for local_ip in (self.local_ips or []):
+            try:
+                mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(local_ip))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                joined = True
+            except Exception:
+                pass
+        if not joined:
+            try:
+                mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                joined = True
+            except Exception as e:
+                print(f"[!] Erreur JOIN_MEMBERSHIP: {e}")
 
         while self.running:
             try:
@@ -227,16 +281,25 @@ class ArchipelNode:
                             tcp_port = info.get('tcp_port', TCP_PORT)
                             if 'pubkey' in info:
                                 remote_pub = info['pubkey']
+                            if "announce_ip" in info and isinstance(info["announce_ip"], str):
+                                addr_ip = info["announce_ip"]
+                            else:
+                                addr_ip = addr[0]
                         except Exception:
-                            pass
+                            addr_ip = addr[0]
+                    else:
+                        addr_ip = addr[0]
 
                     if not self._is_valid_node_id(remote_id):
                         continue
                     if remote_id != self.node_id:
+                        # Ignore peers not in our local LAN scope.
+                        if not self._is_local_candidate_ip(addr_ip):
+                            continue
                         # Mise à jour Peer Table (Module 1.2)
                         prev = self.peer_table.get(remote_id)
                         entry = {
-                            "ip": addr[0],
+                            "ip": addr_ip,
                             "tcp_port": tcp_port,
                             "last_seen": time.time()
                         }
@@ -245,14 +308,14 @@ class ArchipelNode:
                         self.peer_table[remote_id] = entry
                         self.save_peers()
                         if prev is None:
-                            print(f"\n[+] Nouveau pair : {remote_id} @ {addr[0]}:{tcp_port}")
-                            self._log_event("info", f"New peer: {remote_id} @ {addr[0]}:{tcp_port}")
-                        elif prev.get("ip") != addr[0] or prev.get("tcp_port") != tcp_port:
-                            print(f"\n[~] Pair mis à jour : {remote_id} @ {addr[0]}:{tcp_port}")
-                            self._log_event("info", f"Peer endpoint changed: {remote_id} @ {addr[0]}:{tcp_port}")
+                            print(f"\n[+] Nouveau pair : {remote_id} @ {addr_ip}:{tcp_port}")
+                            self._log_event("info", f"New peer: {remote_id} @ {addr_ip}:{tcp_port}")
+                        elif prev.get("ip") != addr_ip or prev.get("tcp_port") != tcp_port:
+                            print(f"\n[~] Pair mis à jour : {remote_id} @ {addr_ip}:{tcp_port}")
+                            self._log_event("info", f"Peer endpoint changed: {remote_id} @ {addr_ip}:{tcp_port}")
 
                         # Module 1.1 : Réponse PEER_LIST en unicast TCP
-                        threading.Thread(target=self.send_peer_list, args=(addr[0], tcp_port), daemon=True).start()
+                        threading.Thread(target=self.send_peer_list, args=(addr_ip, tcp_port), daemon=True).start()
                 except Exception as e:
                     print(f"[!] Erreur parsing UDP packet: {e}")
             except:
@@ -451,7 +514,36 @@ class ArchipelNode:
                         # fusion simplifiée des tables
                         try:
                             peers = json.loads(data[struct.calcsize(PACKET_FORMAT):-32].decode())
-                            self.peer_table.update(peers)
+                            now = time.time()
+                            if isinstance(peers, dict):
+                                for pid, info in peers.items():
+                                    if not self._is_valid_node_id(pid):
+                                        continue
+                                    if pid == self.node_id:
+                                        continue
+                                    if not isinstance(info, dict):
+                                        continue
+                                    ip = info.get("ip")
+                                    port = info.get("tcp_port")
+                                    last_seen = float(info.get("last_seen", 0) or 0)
+                                    if not ip or not isinstance(port, int):
+                                        continue
+                                    if not self._is_local_candidate_ip(ip):
+                                        continue
+                                    # Reject stale peer list entries to avoid pollution.
+                                    if last_seen and (now - last_seen) > 120:
+                                        continue
+                                    cur = self.peer_table.get(pid)
+                                    if not cur or (last_seen and last_seen > float(cur.get("last_seen", 0) or 0)):
+                                        self.peer_table[pid] = {
+                                            "ip": ip,
+                                            "tcp_port": port,
+                                            "last_seen": last_seen or now,
+                                            "pubkey": info.get("pubkey"),
+                                            "trusted": bool(info.get("trusted", False)),
+                                            "trusted_at": int(info.get("trusted_at", 0) or 0),
+                                        }
+                                self.save_peers()
                         except Exception:
                             pass
                     elif msg_type == TYPE_MSG:
