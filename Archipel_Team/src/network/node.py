@@ -22,8 +22,10 @@ TYPE_MANIFEST  = 0x06
 
 
 class ArchipelNode:
-    def __init__(self, node_id, identity=None):
+    def __init__(self, node_id, identity=None, tcp_port=None):
         self.node_id = node_id
+        # allow overriding the TCP port per-instance (for tests/multi-nodes)
+        self.tcp_port = tcp_port if tcp_port is not None else TCP_PORT
         # identite : tuple (signing_priv, verify_pub)
         if identity is None:
             # essayer de charger clés depuis disque
@@ -38,6 +40,11 @@ class ArchipelNode:
         self.peer_table = {}  # Module 1.2: Table de pairs
         # stockage des manifests reçus (file_id -> manifest dict)
         self.manifests = {}
+
+        # download manager (Sprint 4)
+        from transfer.manager import DownloadManager
+        self.dl_manager = DownloadManager(self)
+
         self.running = True
         self.db_file = "peer_table.json"
         self.load_peers()  # Charger les pairs existants au démarrage
@@ -115,7 +122,7 @@ class ArchipelNode:
                 # Payload avec timestamp pour le timeout et notre clé publique
                 import binascii
                 payload = json.dumps({
-                    "tcp_port": TCP_PORT,
+                    "tcp_port": self.tcp_port,
                     "timestamp": int(time.time()),
                     "pubkey": binascii.hexlify(self.verify_key.encode()).decode()
                 }).encode()
@@ -221,7 +228,7 @@ class ArchipelNode:
         try:
             with socket.create_connection((target_ip, target_port), timeout=5) as sock:
                 node_id_bytes = self.node_id.encode().ljust(32, b'\0')[:32]
-                payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx}).encode()
+                payload = json.dumps({"file_id": file_id, "chunk_idx": chunk_idx, "reply_port": TCP_PORT}).encode()
                 packet = build_packet(TYPE_CHUNK_REQ, node_id_bytes, payload, b"test_secret_key")
                 sock.sendall(packet)
         except Exception as e:
@@ -275,9 +282,9 @@ class ArchipelNode:
         """Serveur TCP gérant au moins 10 connexions (Module 1.3)"""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('0.0.0.0', TCP_PORT))
+        server.bind(('0.0.0.0', self.tcp_port))
         server.listen(10)
-        print(f"[*] Serveur TCP d'écoute activé sur le port {TCP_PORT}")
+        print(f"[*] Serveur TCP d'écoute activé sur le port {self.tcp_port}")
 
         while self.running:
             try:
@@ -293,6 +300,12 @@ class ArchipelNode:
                 data = sock.recv(4096)
                 if data and data.startswith(b"ARCH"):
                     msg_type = data[4]
+                    # resolve remote_id once at the beginning
+                    remote_id = None
+                    for pid, info in self.peer_table.items():
+                        if info.get('ip') == addr[0]:
+                            remote_id = pid
+                            break
                     if msg_type == TYPE_PEER_LIST:
                         print(f"[TCP] Peer List reçue de {addr[0]}")
                         # fusion simplifiée des tables
@@ -303,11 +316,6 @@ class ArchipelNode:
                             pass
                     elif msg_type == TYPE_MSG:
                         try:
-                            remote_id = None
-                            for pid, info in self.peer_table.items():
-                                if info.get('ip') == addr[0]:
-                                    remote_id = pid
-                                    break
                             if remote_id:
                                 payload = data[struct.calcsize(PACKET_FORMAT):-32]
                                 plaintext = self.decrypt_from_peer(remote_id, payload)
@@ -316,16 +324,13 @@ class ArchipelNode:
                             print(f"[!] Erreur décryptage message: {e}")
                     elif msg_type == TYPE_MANIFEST:
                         try:
-                            remote_id = None
-                            for pid, info in self.peer_table.items():
-                                if info.get('ip') == addr[0]:
-                                    remote_id = pid
-                                    break
                             if remote_id:
                                 payload = data[struct.calcsize(PACKET_FORMAT):-32]
                                 manifest = json.loads(payload.decode())
                                 print(f"[MANIFEST] reçu de {remote_id} id={manifest.get('file_id')}")
                                 self.manifests[manifest['file_id']] = manifest
+                                # inform download manager
+                                self.dl_manager.register_manifest(manifest, remote_id)
                         except Exception as e:
                             print(f"[!] Erreur manifest: {e}")
                     elif msg_type == TYPE_CHUNK_REQ:
@@ -333,11 +338,14 @@ class ArchipelNode:
                             payload = data[struct.calcsize(PACKET_FORMAT):-32]
                             req = json.loads(payload.decode())
                             fid = req['file_id']; idx = req['chunk_idx']
-                            print(f"[CHUNK_REQ] {addr} file={fid} idx={idx}")
+                            reply_port = req.get('reply_port', TCP_PORT)
+                            print(f"[CHUNK_REQ] {addr} file={fid} idx={idx} reply_port={reply_port}")
                             # rechercher manifest local
                             m = self.manifests.get(fid)
+                            print(f"[DBG] manifest pour {fid}: {m is not None}")
                             if m:
                                 filepath = m.get('filepath')
+                                print(f"[DBG] filepath: {filepath}, exists: {os.path.exists(filepath) if filepath else False}")
                                 if filepath and os.path.exists(filepath):
                                     with open(filepath,'rb') as f:
                                         f.seek(idx * m['chunk_size'])
@@ -345,14 +353,26 @@ class ArchipelNode:
                                         resp = {"file_id": fid, "chunk_idx": idx, "data": data_chunk.hex(), "chunk_hash": m['chunks'][idx]['hash']}
                                         node_id_bytes = self.node_id.encode().ljust(32,b'\0')[:32]
                                         packet = build_packet(TYPE_CHUNK_DATA, node_id_bytes, json.dumps(resp).encode(), b"test_secret_key")
-                                        sock.sendall(packet)
+                                        # Send back to the requester on a NEW connection
+                                        requester_ip = addr[0]
+                                        try:
+                                            with socket.create_connection((requester_ip, reply_port), timeout=5) as response_sock:
+                                                response_sock.sendall(packet)
+                                                print(f"[DBG] CHUNK_DATA sent back to {requester_ip}:{reply_port}, size={len(data_chunk)}")
+                                        except Exception as e2:
+                                            print(f"[!] Erreur envoi CHUNK_DATA back: {e2}")
                         except Exception as e:
                             print(f"[!] Erreur CHUNK_REQ: {e}")
+                            import traceback
+                            traceback.print_exc()
                     elif msg_type == TYPE_CHUNK_DATA:
                         try:
                             payload = data[struct.calcsize(PACKET_FORMAT):-32]
                             resp = json.loads(payload.decode())
                             print(f"[CHUNK_DATA] reçu idx={resp['chunk_idx']} hash={resp['chunk_hash']}")
+                            # delegate to download manager
+                            if remote_id:
+                                self.dl_manager.handle_chunk_data(resp, remote_id)
                         except Exception as e:
                             print(f"[!] Erreur CHUNK_DATA: {e}")
             except Exception as e:
@@ -405,8 +425,8 @@ if __name__ == "__main__":
 
     threading.Thread(target=status_loop, daemon=True).start()
 
-    # CLI interactif minimal
-    print("Commande: peers | msg <node_id> <texte> | quit")
+    # --- CLI interactif minimal et commandes Sprint4
+    print("Commande: peers | msg <node_id> <texte> | manifest <file> | download <file_id> [path] | status | quit")
     try:
         while True:
             try:
@@ -415,7 +435,7 @@ if __name__ == "__main__":
                 break
             if not cmd:
                 continue
-            parts = cmd.split(' ', 2)
+            parts = cmd.split(' ', 3)
             if parts[0] == 'quit':
                 break
             elif parts[0] == 'peers':
@@ -438,8 +458,20 @@ if __name__ == "__main__":
                     if pid == dest:
                         node.request_chunk(info['ip'], info['tcp_port'], fid, int(idx))
                         break
+            elif parts[0] == 'download' and len(parts) >= 2:
+                fid = parts[1]
+                path = parts[2] if len(parts) == 3 else None
+                try:
+                    node.dl_manager.start_download(fid, path)
+                    print(f"[DL] démarrage du téléchargement {fid}")
+                except Exception as e:
+                    print(f"[!] impossible de démarrer download: {e}")
+            elif parts[0] == 'status':
+                for fid, sess in node.dl_manager.sessions.items():
+                    done, total = sess.progress()
+                    print(f"{fid}: {done}/{total}")
             else:
-                print("Usage: peers | msg <node_id> <texte> | manifest <file> | chunk <node_id> <file_id> <idx> | quit")
+                print("Usage: peers | msg <node_id> <texte> | manifest <file> | download <file_id> [path] | status | quit")
     except KeyboardInterrupt:
         pass
     finally:
