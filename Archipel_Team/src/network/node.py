@@ -59,7 +59,7 @@ class ArchipelNode:
             except Exception as e:
                 print(f"[!] Impossible de charger identité : {e}")
         # générer nouvelle identité
-        from ..crypto.identite import generate_identity
+        from crypto.identite import generate_identity
         priv, pub = generate_identity()
         # enregistrer la clé privée en hex
         import binascii
