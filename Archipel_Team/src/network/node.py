@@ -371,6 +371,7 @@ class ArchipelNode:
         manifest = mf.create_manifest(filepath)
         manifest["filepath"] = filepath
         manifest["sender_id"] = self.node_uid
+        manifest["allowed_peers"] = [peer_id]
         self.manifests[manifest["file_id"]] = manifest
         self.send_manifest(entry["ip"], entry["tcp_port"], manifest)
         self._log_event("info", f"Manifest sent to {peer_id}: {manifest['file_id']}")
@@ -560,6 +561,10 @@ class ArchipelNode:
                             m = self.manifests.get(fid)
                             print(f"[DBG] manifest pour {fid}: {m is not None}")
                             if m:
+                                allowed = m.get("allowed_peers")
+                                if isinstance(allowed, list) and remote_id not in allowed:
+                                    print(f"[SEC] CHUNK_REQ refuse pour pair non autorise: {remote_id}")
+                                    return
                                 filepath = m.get('filepath')
                                 print(f"[DBG] filepath: {filepath}, exists: {os.path.exists(filepath) if filepath else False}")
                                 if filepath and os.path.exists(filepath):
