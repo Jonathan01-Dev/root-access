@@ -127,3 +127,10 @@ Une fois `start` lance:
 - Transfert: manifest + chunk manager
 - Integration Sprint 4: CLI unifie + module IA optionnel + documentation
 
+## Ressources projet (Point 5)
+
+- Dependances Python: `requirements.txt`
+- Variables d'environnement: `.env.example`
+- Spec protocole: `docs/protocol-spec.md`
+- Vue architecture: `docs/architecture.md`
+- Script de passage demo: `demo/demo-steps.md`
